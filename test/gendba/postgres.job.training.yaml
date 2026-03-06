@@ -1,0 +1,18 @@
+title: Postgres JOB GenDBA Training Data
+repetitions: 1
+warmup: 0
+timeout: 60
+global_timeout: 0
+fetch_result: true
+query_plan:
+  retrieve: true
+  system_representation: true
+output: test/gendba/postgres_job_training/
+systems:
+  - title: Postgres ${version}
+    dbms: postgres
+    disabled: false
+    parameter:
+      version: "18"
+benchmarks:
+  - name: job
