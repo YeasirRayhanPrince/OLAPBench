@@ -15,7 +15,8 @@ simplejson
 
 
 # Umbra & Postgres
-psycopg2
+# Use wheel distribution to avoid requiring local pg_config/libpq headers.
+psycopg2-binary
 
 # ClickHouse
 clickhouse-connect
