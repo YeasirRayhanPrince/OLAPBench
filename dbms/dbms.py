@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import os
 import re
 from abc import ABC, abstractmethod
@@ -373,12 +374,29 @@ def database_systems() -> Dict[str, DBMSDescription]:
     Returns:
         Dict[str, DBMSDescription]: A dictionary mapping DBMS names to their description classes.
     """
-    from dbms import apollo, cedardb, clickhouse, duckdb, hyper, monetdb, postgres, singlestore, sqlserver, umbra, umbradev
-
-    dbms_list = [
-        apollo.ApolloDescription, cedardb.CedarDBDescription, clickhouse.ClickHouseDescription,
-        duckdb.DuckDBDescription, hyper.HyperDescription, monetdb.MonetDBDescription,
-        postgres.PostgresDescription, singlestore.SingleStoreDescription, sqlserver.SQLServerDescription,
-        umbra.UmbraDescription, umbradev.UmbraDevDescription
+    module_descriptions = [
+        ("dbms.apollo", "ApolloDescription"),
+        ("dbms.cedardb", "CedarDBDescription"),
+        ("dbms.clickhouse", "ClickHouseDescription"),
+        ("dbms.duckdb", "DuckDBDescription"),
+        ("dbms.hyper", "HyperDescription"),
+        ("dbms.monetdb", "MonetDBDescription"),
+        ("dbms.postgres", "PostgresDescription"),
+        ("dbms.singlestore", "SingleStoreDescription"),
+        ("dbms.sqlserver", "SQLServerDescription"),
+        ("dbms.umbra", "UmbraDescription"),
+        ("dbms.umbradev", "UmbraDevDescription"),
     ]
-    return {dbms.get_name(): dbms for dbms in dbms_list}
+
+    descriptions: Dict[str, DBMSDescription] = {}
+    for module_name, description_name in module_descriptions:
+        try:
+            module = importlib.import_module(module_name)
+            description = getattr(module, description_name)
+            descriptions[description.get_name()] = description
+        except ImportError as e:
+            logger.log_warn_verbose(
+                f"Skipping DBMS module {module_name} because an optional dependency is missing: {e}"
+            )
+
+    return descriptions

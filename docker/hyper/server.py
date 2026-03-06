@@ -29,7 +29,8 @@ def sql_encoder(obj):
         return str(obj)
     if isinstance(obj, str):
         return obj
-    raise TypeError("Type %s not serializable" % type(obj))
+    # Avoid failing the entire request on uncommon Hyper scalar types.
+    return str(obj)
 
 
 db_dir = "/db"
@@ -70,18 +71,18 @@ async def execute_query(payload: dict):
 
         begin = time.time()
         try:
-            cursor = conn.execute_query(query=query.strip())
-            
-            # Extract column names
-            columns = [col.name for col in cursor.schema.columns]
-            
-            result = cursor.fetchall()
-
             if fetch:
-                rows = len(result)
+                # Ensure result objects are always closed before the next statement.
+                with conn.execute_query(query=query.strip()) as cursor:
+                    # Extract column names
+                    columns = [col.name for col in cursor.schema.columns]
+                    result = cursor.fetchall()
+                    rows = len(result)
 
-                if 0 < fetch_limit < len(result):
-                    result = result[:fetch_limit]
+                    if 0 < fetch_limit < len(result):
+                        result = result[:fetch_limit]
+            else:
+                conn.execute_command(query.strip())
 
             client_total = (time.time() - begin) * 1000
         except Exception as e:
@@ -115,13 +116,17 @@ async def execute_query(payload: dict):
 
     # Log results
     if fetch:
-        with open(results_path, "w") as f:
-            # Store columns and results separately
-            result_data = {
-                "columns": columns,
-                "results": result
-            }
-            f.write(json.dumps(result_data, use_decimal=True, default=sql_encoder, allow_nan=True))
+        try:
+            with open(results_path, "w") as f:
+                # Store columns and results separately
+                result_data = {
+                    "columns": columns,
+                    "results": result
+                }
+                f.write(json.dumps(result_data, use_decimal=True, default=sql_encoder, allow_nan=True))
+        except Exception as e:
+            if error_message is None:
+                error_message = f"Failed to serialize result set: {e}"
 
     return {"rows": rows, "error": error_message, "client_total": client_total, "total": total, "execution": execution, "compilation": compilation}
 
