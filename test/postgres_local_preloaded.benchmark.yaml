@@ -1,0 +1,27 @@
+title: Postgres Local Preloaded Test
+repetitions: 1
+warmup: 0
+timeout: 300
+global_timeout: 3600
+fetch_result: false
+load_mode: preloaded
+query_plan:
+  retrieve: true
+  system_representation: true
+output: test/postgres_local_preloaded/
+systems:
+  - title: Local Postgres Preloaded
+    dbms: postgres
+    disabled: false
+    parameter:
+      index: foreign
+      version: "12.5"
+    local:
+      enabled: true
+      host: localhost
+      port: 5432
+      user: yrayhan
+      # No password needed - using trust authentication
+      database: postgres
+benchmarks:
+  - name: gendba-pool

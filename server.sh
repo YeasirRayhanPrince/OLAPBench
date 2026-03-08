@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
-# Activate virtual environment
-source .venv/bin/activate
+set -euo pipefail
 
-# Run the HTTP server
-python3 server.py "$@"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
+require_venv
+
+cd "${REPO_ROOT}"
+exec "${PYTHON_BIN}" "${REPO_ROOT}/server.py" "$@"

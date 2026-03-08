@@ -95,6 +95,33 @@
         "settings": {
           "type": "object",
           "additionalProperties": true
+        },
+        "local": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "database": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "enabled"
+          ]
         }
       },
       "required": [
@@ -160,6 +187,25 @@
     },
     "query_plan": {
       "$ref": "#/definitions/query_plan"
+    },
+    "load_mode": {
+      "type": "string",
+      "enum": [
+        "managed",
+        "preloaded"
+      ],
+      "default": "managed",
+      "$comment": "Whether OLAPBench should load benchmark tables or use an already prepared database."
+    },
+    "drop_tables": {
+      "type": "boolean",
+      "default": false,
+      "$comment": "Drop benchmark tables before loading data. Only used when load_mode is managed."
+    },
+    "cleanup_after": {
+      "type": "boolean",
+      "default": false,
+      "$comment": "Drop benchmark tables after the run completes. Only used when load_mode is managed."
     },
     "parameter": {
       "type": "object"

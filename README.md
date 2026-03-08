@@ -26,6 +26,7 @@ OLAPBench is designed to provide fair, reproducible, and comprehensive performan
 The framework supports:
 - **Multiple benchmark suites** including TPC-H, TPC-DS, ClickBench, Join Order Benchmark (JOB), Star Schema Benchmark (SSB), and StackOverflow
 - **Containerized database deployments** for consistent testing environments
+- **Local PostgreSQL execution** against a database already running on the same machine
 - **Query plan analysis** and performance profiling
 - **Automated result collection** and CSV export
 - **Timeout handling** and error recovery
@@ -36,6 +37,7 @@ The framework supports:
 - 🚀 **Automated Benchmarking**: Complete automation from data generation to result analysis
 - 📊 **Multiple Metrics**: Query execution time, compilation time, memory usage, and result validation
 - 🐳 **Docker Integration**: Containerized database deployments for reproducible environments
+- 🗄️ **Local PostgreSQL Support**: Run benchmarks against a PostgreSQL instance on the current machine
 - 📈 **Query Plan Analysis**: Capture and analyze query execution plans
 - 🔄 **Retry Logic**: Automatic retry on failures with container cleanup
 - 📝 **Comprehensive Logging**: Detailed logging with configurable verbosity levels
@@ -116,6 +118,8 @@ The framework supports:
    ```bash
    ./setup.sh
    ```
+
+   The canonical shell entrypoints remain at the repo root, except `run_*.sh` helpers which live under `shell/`.
 
    This will:
    - Create a Python virtual environment in `.venv/`
@@ -219,6 +223,45 @@ systems:
 
 This creates 16 different test configurations (4 versions × 4 buffer sizes).
 
+### Local PostgreSQL Mode
+
+Use `systems[].local` to connect to a PostgreSQL instance already running on this machine instead of launching Docker. In this repository, local mode is implemented for `postgres` only:
+
+```yaml
+title: "Local Postgres Run"
+repetitions: 1
+warmup: 0
+timeout: 300
+global_timeout: 3600
+fetch_result: false
+load_mode: managed
+drop_tables: true
+output: "results/postgres_local/"
+
+systems:
+  - title: "Local PostgreSQL"
+    dbms: postgres
+    parameter:
+      index: foreign
+    local:
+      enabled: true
+      host: localhost
+      port: 5432
+      user: postgres
+      password: postgres
+      database: postgres
+
+benchmarks:
+  - name: tpch
+    scale: 0.01
+```
+
+`load_mode` controls how OLAPBench treats the local database:
+- `managed`: create benchmark tables, load benchmark data, and optionally use `drop_tables` / `cleanup_after`
+- `preloaded`: connect to an already prepared database and run queries only
+
+For `preloaded`, do not rely on `cleanup_after`; OLAPBench skips cleanup in that mode to avoid dropping user-managed tables.
+
 ## Running Benchmarks
 
 ### Command Line Options
@@ -254,6 +297,21 @@ Options:
   --clear          Clear previous results
   --launch         Launch databases only
 ```
+
+### Local PostgreSQL Examples
+
+```bash
+# Managed load into a local PostgreSQL instance
+./shell/run_local_postgres_benchmark.sh --verbose
+
+# Query an already prepared local PostgreSQL database
+./shell/run_local_postgres_benchmark.sh --config test/postgres_local_preloaded.benchmark.yaml --verbose
+```
+
+Prerequisites for local mode:
+- PostgreSQL must already be running on this machine
+- the configured user must have permission to connect and, for `managed` mode, create/drop/load the benchmark tables
+- benchmark data files still come from the local `data/` directory managed by OLAPBench
 
 ### Environment Variables
 
@@ -331,8 +389,9 @@ print(summary)
 ```
 OLAPBench/
 ├── benchmark.py              # Main benchmark runner
-├── benchmark.sh              # Shell wrapper script
+├── benchmark.sh              # Benchmark shell entrypoint
 ├── setup.sh                  # Environment setup
+├── shell/                    # run_*.sh helper entrypoints
 ├── requirements.txt          # Python dependencies
 ├── test.py                   # Test runner
 ├── benchmarks/               # Benchmark implementations

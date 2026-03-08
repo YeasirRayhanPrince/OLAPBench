@@ -6,7 +6,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from gendba_pipeline.export import main
+from gendba_pipeline.run import main
 
 
 if __name__ == "__main__":

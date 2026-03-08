@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "title": "GenDBA Dataset Pipeline Schema",
+  "definitions": {
+    "query_plan": {
+      "type": "object",
+      "properties": {
+        "retrieve": {
+          "type": "boolean",
+          "default": true
+        },
+        "system_representation": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "logical_ir": {
+      "type": "object",
+      "properties": {
+        "source_jsonl": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_jsonl"
+      ],
+      "additionalProperties": false
+    },
+    "system": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "dbms": {
+          "type": "string",
+          "enum": [
+            "apollo",
+            "cedardb",
+            "clickhouse",
+            "duckdb",
+            "hyper",
+            "monetdb",
+            "postgres",
+            "singlestore",
+            "sqlserver",
+            "umbra",
+            "umbradev"
+          ]
+        },
+        "disabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "parameter": {
+          "type": "object"
+        },
+        "settings": {
+          "type": "object"
+        },
+        "local": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "database": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "enabled"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "title",
+        "dbms"
+      ],
+      "additionalProperties": false
+    },
+    "benchmark": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "disabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "query_dir": {
+          "type": "string"
+        },
+        "queries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "excluded_queries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "logical_ir": {
+          "$ref": "#/definitions/logical_ir"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "output_root": {
+      "type": "string"
+    },
+    "calcite": {
+      "type": "object",
+      "properties": {
+        "plangen_bin": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "include_non_success": {
+      "type": "boolean",
+      "default": false
+    },
+    "run": {
+      "type": "object",
+      "properties": {
+        "clear": {
+          "type": "boolean",
+          "default": true
+        },
+        "verbose": {
+          "type": "boolean",
+          "default": false
+        },
+        "very_verbose": {
+          "type": "boolean",
+          "default": false
+        },
+        "fail_fast": {
+          "type": "boolean",
+          "default": false
+        },
+        "db_dir": {
+          "type": "string",
+          "default": "db"
+        },
+        "data_dir": {
+          "type": "string",
+          "default": "data"
+        }
+      },
+      "additionalProperties": false
+    },
+    "benchmark_defaults": {
+      "type": "object",
+      "properties": {
+        "repetitions": {
+          "type": "integer"
+        },
+        "warmup": {
+          "type": "integer"
+        },
+        "timeout": {
+          "type": "number"
+        },
+        "global_timeout": {
+          "type": "number"
+        },
+        "fetch_result": {
+          "type": "boolean"
+        },
+        "fetch_result_limit": {
+          "type": "integer"
+        },
+        "query_seed": {
+          "type": "integer"
+        },
+        "query_plan": {
+          "$ref": "#/definitions/query_plan"
+        },
+        "load_mode": {
+          "type": "string",
+          "enum": [
+            "managed",
+            "preloaded"
+          ]
+        },
+        "drop_tables": {
+          "type": "boolean"
+        },
+        "cleanup_after": {
+          "type": "boolean"
+        },
+        "parameter": {
+          "type": "object"
+        },
+        "settings": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "repetitions",
+        "warmup"
+      ],
+      "additionalProperties": false
+    },
+    "systems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/system"
+      },
+      "minItems": 1
+    },
+    "benchmarks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/benchmark"
+      },
+      "minItems": 1
+    },
+    "export": {
+      "type": "object",
+      "properties": {
+        "jsonl_name": {
+          "type": "string",
+          "default": "training.jsonl"
+        },
+        "training_jsonl_name": {
+          "type": "string"
+        },
+        "manifest_jsonl_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "name",
+    "output_root",
+    "benchmark_defaults",
+    "systems",
+    "benchmarks"
+  ],
+  "additionalProperties": false
+}
