@@ -58,6 +58,7 @@ def run_benchmark(benchmark: Benchmark, systems: List[System], definition: dict,
     fetch_result = definition.get("fetch_result", True)
     fetch_result_limit = definition.get("fetch_result_limit", 0)
     query_seed = definition.get("query_seed", None)
+    load_mode = definition.get("load_mode", "managed")
 
     benchmark.dbgen()
 
@@ -121,6 +122,7 @@ def run_benchmark(benchmark: Benchmark, systems: List[System], definition: dict,
         for system in systems:
             logger.log_header(system.title)
             logger.log_driver(f"Running {system.title} on {benchmark.result_name} (dbms: {system.dbms}, params: {system.params}, settings: {system.settings})")
+            use_local = system.params.get("use_local", False)
 
             # Prepare the benchmark
             match benchmark_type:
@@ -168,7 +170,11 @@ def run_benchmark(benchmark: Benchmark, systems: List[System], definition: dict,
                         continue
 
             with dbms_descriptions[system.dbms].instantiate(benchmark, db_dir, data_dir, system.params, system.settings) as dbms:
-                dbms.load_database()
+                if benchmark_type == "queries" and load_mode == "managed":
+                    drop_tables = definition.get("drop_tables", False)
+                    dbms.load_database(drop_tables=drop_tables)
+                elif benchmark_type == "queries":
+                    logger.log_driver("Skipping database load because load_mode is preloaded")
 
                 if benchmark_type == "queries":
                     logger.log_driver("Benchmarking queries")
@@ -263,6 +269,15 @@ def run_benchmark(benchmark: Benchmark, systems: List[System], definition: dict,
                 else:
                     raise ValueError("benchmark type not supported")
 
+                if definition.get("cleanup_after", False):
+                    if load_mode != "managed":
+                        logger.log_warn("Skipping cleanup_after because load_mode is preloaded")
+                    elif use_local:
+                        logger.log_driver("Cleaning up: dropping benchmark tables from local database")
+                        schema = benchmark.get_schema(primary_key=True, foreign_keys=False)
+                        schema = dbms._transform_schema(schema)
+                        dbms._drop_all_tables(schema)
+
 
 def clear(benchmark: Benchmark, result_dir: str):
     """
@@ -332,6 +347,16 @@ def run_benchmarks(args):
 
         for params in unfold(params):
             for settings in unfold(settings):
+                if "local" in system and system["local"].get("enabled", False):
+                    if system["dbms"] != "postgres":
+                        raise ValueError(f"Local mode is currently only supported for postgres, not {system['dbms']}")
+                    params["use_local"] = True
+                    params["local_host"] = system["local"].get("host", "localhost")
+                    params["local_port"] = system["local"].get("port", None)
+                    params["local_user"] = system["local"].get("user", None)
+                    params["local_password"] = system["local"].get("password", None)
+                    params["local_database"] = system["local"].get("database", None)
+
                 # fill the title
                 template = Template(system["title"])
                 title = template.substitute(**settings, **params)

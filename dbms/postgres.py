@@ -27,13 +27,21 @@ class Postgres(DBMS):
     def connection_string(self) -> str:
         return self._connection_string
 
-    def _connect(self, database: str, user: str, password: str, port: int):
+    def _connect(self, database: str, user: str, password: str | None, host: str, port: int):
         self.connection = None
         start_time = time.time()
         check_timeout = 120  # 2 minutes
         while time.time() - start_time < check_timeout:
             try:
-                self.connection = psycopg2.connect(database=database, user=user, password=password, host="localhost", port=port)
+                connect_kwargs = {
+                    "database": database,
+                    "user": user,
+                    "host": host,
+                    "port": port,
+                }
+                if password is not None:
+                    connect_kwargs["password"] = password
+                self.connection = psycopg2.connect(**connect_kwargs)
                 break
             except psycopg2.OperationalError:
                 time.sleep(1)  # 1 second
@@ -41,7 +49,10 @@ class Postgres(DBMS):
         if self.connection is None:
             raise Exception(f"Unable to connect to {self.name}")
 
-        self._connection_string = f"PGPASSWORD='{password}' psql -h localhost -p {port} -U {user} -d {database}"
+        if password is not None:
+            self._connection_string = f"PGPASSWORD='{password}' psql -h {host} -p {port} -U {user} -d {database}"
+        else:
+            self._connection_string = f"psql -h {host} -p {port} -U {user} -d {database}"
 
         self.connection.set_session(autocommit=True)
         self.connection.set_client_encoding('utf-8')
@@ -92,33 +103,42 @@ class Postgres(DBMS):
             config(key, value)
 
     def __enter__(self):
-        # prepare database directory
-        self.host_dir = tempfile.TemporaryDirectory(dir=self._db_dir)
+        if self._use_local:
+            host = self._local_host or "localhost"
+            port = self._local_port or 5432
+            user = self._local_user or "postgres"
+            password = self._local_password
+            database = self._local_database or "postgres"
 
-        # write config file
-        with open(os.path.join(self.host_dir.name, "postgres.conf"), "w") as file:
-            self._write_config_file(file)
+            self.host_dir = None
+            logger.log_dbms(f"Connecting to local PostgreSQL at {host}:{port}", self)
+            self._connect(database, user, password, host, port)
+        else:
+            self.host_dir = tempfile.TemporaryDirectory(dir=self._db_dir)
 
-        # start Docker container
-        postgres_environment = {
-            'POSTGRES_PASSWORD': 'postgres',
-            'PGDATA': '/db/postgres',
-            'LC_COLLATE': 'C',
-            'LC_CTYPE': 'C',
-        }
-        docker_params = {
-            "shm_size": "%d" % self._buffer_size,
-            "command": "postgres -c config_file=/db/postgres.conf",
-        }
-        self._host_port = self._host_port if self._host_port is not None else 54321
-        self._start_container(postgres_environment, 5432, self._host_port, self.host_dir.name, "/db", docker_params=docker_params)
-        self._connect("postgres", "postgres", "postgres", self._host_port)
+            with open(os.path.join(self.host_dir.name, "postgres.conf"), "w") as file:
+                self._write_config_file(file)
+
+            postgres_environment = {
+                'POSTGRES_PASSWORD': 'postgres',
+                'PGDATA': '/db/postgres',
+                'LC_COLLATE': 'C',
+                'LC_CTYPE': 'C',
+            }
+            docker_params = {
+                "shm_size": "%d" % self._buffer_size,
+                "command": "postgres -c config_file=/db/postgres.conf",
+            }
+            self._host_port = self._host_port if self._host_port is not None else 54321
+            self._start_container(postgres_environment, 5432, self._host_port, self.host_dir.name, "/db", docker_params=docker_params)
+            self._connect("postgres", "postgres", "postgres", "localhost", self._host_port)
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.connection.close()
-        self._close_container()
+        if not self._use_local:
+            self._close_container()
         if self.host_dir:
             self.host_dir.cleanup()
 
@@ -126,7 +146,8 @@ class Postgres(DBMS):
         return sql.create_table_statements(schema)
 
     def _copy_statements(self, schema: dict) -> list[str]:
-        return sql.copy_statements_postgres(schema, "/data")
+        data_path = self._data_dir if self._use_local else "/data"
+        return sql.copy_statements_postgres(schema, data_path)
 
     def _execute(self, query: str, fetch_result: bool, timeout: int = 0, fetch_result_limit: int = 0) -> Result:
         result = Result()
@@ -134,8 +155,9 @@ class Postgres(DBMS):
         timer = None
         timer_kill = None
         if timeout > 0:
-            timer_kill = threading.Timer(timeout * 10, self._kill_container)
-            timer_kill.start()
+            if not self._use_local:
+                timer_kill = threading.Timer(timeout * 10, self._kill_container)
+                timer_kill.start()
             timer = threading.Timer(timeout, self.connection.cancel)
             timer.start()
 
@@ -194,6 +216,14 @@ class Postgres(DBMS):
         plan_parser = PostgresParser(include_system_representation=include_system_representation)
         query_plan = plan_parser.parse_json_plan(query, json_plan)
         return query_plan
+
+    def _drop_all_tables(self, schema: dict):
+        for table in reversed(schema["tables"]):
+            drop_statement = f'DROP TABLE IF EXISTS {table["name"]} CASCADE'
+            logger.log_verbose_sql(drop_statement)
+            output = self._execute(drop_statement, False)
+            if output.state != Result.SUCCESS:
+                logger.log_warn(f'Failed to drop table {table["name"]}: {output.message}')
 
 
 class PostgresDescription(DBMSDescription):

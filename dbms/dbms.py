@@ -127,10 +127,16 @@ class DBMS(ABC):
         self._index = DBMS.Index.from_string(params.get("index", "primary"))
         self._version = params.get("version", "latest")
         self._umbra_planner = params.get("umbra_planner", False)
-        self._docker = docker.from_env()
+        self._docker = None
         self._host_port = params.get('host_port', None)
 
         self._settings = settings
+        self._use_local = params.get("use_local", False)
+        self._local_host = params.get("local_host", "localhost")
+        self._local_port = params.get("local_port", None)
+        self._local_user = params.get("local_user", None)
+        self._local_password = params.get("local_password", None)
+        self._local_database = params.get("local_database", None)
 
         self.container = None
 
@@ -147,11 +153,16 @@ class DBMS(ABC):
     def docker_image_name(self) -> str:
         pass
 
+    def _get_docker(self):
+        if self._docker is None:
+            self._docker = docker.from_env()
+        return self._docker
+
     def _pull_image(self):
         # Pull the docker image
         logger.log_dbms(f"Pulling {self.docker_image_name} docker image", self)
         try:
-            return self._docker.images.pull(self.docker_image_name)
+            return self._get_docker().images.pull(self.docker_image_name)
         except Exception as e:
             logger.log_dbms(f"Could not pull {self.docker_image_name} docker image: {e}", self)
 
@@ -161,7 +172,7 @@ class DBMS(ABC):
 
         # Start the container
         try:
-            self.container = self._docker.containers.run(
+            self.container = self._get_docker().containers.run(
                 image=image,
                 auto_remove=True,
                 detach=True,
@@ -187,7 +198,7 @@ class DBMS(ABC):
         if self.container is None:
             return "not started"
         try:
-            return self._docker.containers.get(self.container.id).status
+            return self._get_docker().containers.get(self.container.id).status
         except Exception:
             return "removed"
 
@@ -239,11 +250,19 @@ class DBMS(ABC):
     def _execute(self, query: str, fetch_result: bool, timeout: int = 0, fetch_result_limit: int = 0) -> Result:
         raise NotImplementedError()
 
-    def load_database(self):
+    def _drop_all_tables(self, schema: dict):
+        """Drop all tables in the schema. Override in subclasses when needed."""
+        return None
+
+    def load_database(self, drop_tables: bool = False):
         primary_key = self._index in [DBMS.Index.PRIMARY, DBMS.Index.FOREIGN]
         foreign_keys = self._index == DBMS.Index.FOREIGN
         schema = self._benchmark.get_schema(primary_key=primary_key, foreign_keys=foreign_keys)
         schema = self._transform_schema(schema)
+
+        if drop_tables:
+            logger.log_dbms("Dropping all existing tables", self)
+            self._drop_all_tables(schema)
 
         create_stmts = self._create_table_statements(schema)
         for create_statement in create_stmts:

@@ -1,0 +1,39 @@
+# SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'postgres' AND pid <> pg_backend_pid() AND state <> 'idle';
+# To check running queries: SELECT pid, usename, state, query FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND state <> 'idle';
+name: gendba_local_postgres_preloaded
+output_root: gendba_pipeline/output/gendba_local_postgres_preloaded
+calcite:
+  plangen_bin: /scratch1/yrayhan/calcite/benchmarks/plangen/build/install/plangen/bin/plangen
+include_non_success: false
+run:
+  clear: true
+  verbose: true
+  fail_fast: false
+benchmark_defaults:
+  repetitions: 1
+  warmup: 0
+  timeout: 300
+  global_timeout: 0
+  fetch_result: false
+  load_mode: preloaded
+  query_plan:
+    retrieve: true
+    system_representation: true
+systems:
+  - title: Local Postgres Preloaded
+    dbms: postgres
+    parameter:
+      index: foreign
+      version: "12.5"
+    local:
+      enabled: true
+      host: localhost
+      port: 5432
+      user: yrayhan
+      database: postgres
+benchmarks:
+  - name: gendba-pool
+    query_dir: exhaustive
+export:
+  training_jsonl_name: gendba_pool.training.jsonl
+  manifest_jsonl_name: gendba_pool.manifest.jsonl

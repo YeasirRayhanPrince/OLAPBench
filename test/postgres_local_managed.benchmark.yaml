@@ -1,0 +1,29 @@
+title: Postgres Local Managed Load Test
+repetitions: 1
+warmup: 0
+timeout: 300
+global_timeout: 3600
+fetch_result: false
+load_mode: managed  # Options: managed, preloaded
+drop_tables: true
+cleanup_after: false
+query_plan:
+  retrieve: true
+  system_representation: true
+output: test/postgres_local_managed/
+systems:
+  - title: Local Postgres Managed
+    dbms: postgres
+    disabled: false
+    parameter:
+      index: foreign
+      version: "12.5"
+    local:
+      enabled: true
+      host: localhost
+      port: 5432
+      user: yrayhan
+      # No password needed - using trust authentication
+      database: postgres
+benchmarks:
+  - name: gendba-pool

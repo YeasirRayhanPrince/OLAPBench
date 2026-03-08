@@ -1,9 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-SCRIPT_DIR="$(dirname $(readlink -f $0))"
-source "${SCRIPT_DIR}/.venv/bin/activate"
+set -euo pipefail
 
-"${SCRIPT_DIR}/test.py" $@
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
+require_venv
+
+cd "${REPO_ROOT}"
+"${REPO_ROOT}/test.py" "$@"
 EXIT_CODE=$?
 
 if [[ $EXIT_CODE -eq 0 ]]; then

@@ -1,0 +1,6 @@
+README.md
+setup.py
+calcite_plangen.egg-info/PKG-INFO
+calcite_plangen.egg-info/SOURCES.txt
+calcite_plangen.egg-info/dependency_links.txt
+calcite_plangen.egg-info/top_level.txt

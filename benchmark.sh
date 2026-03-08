@@ -1,58 +1,65 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-SCRIPT_DIR="$(dirname $(readlink -f $0))"
-source "${SCRIPT_DIR}/.venv/bin/activate"
+set -euo pipefail
 
-# Initialize the flags
+# Canonical user-facing benchmark entrypoint.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
+require_venv
+
 NORETRY=false
+VERBOSE=""
+CLEAR=""
+LAUNCH=""
+ORIG_PWD="$(pwd)"
 
-# Parse command-line options
 while [[ $# -gt 0 ]]; do
     case $1 in
     --clear)
         CLEAR="--clear"
-        shift # Move to the next argument
+        shift
         ;;
     --launch)
         LAUNCH="--launch"
-        shift # Move to the next argument
+        shift
         ;;
     --noretry)
         NORETRY=true
-        shift # Move to the next argument
+        shift
         ;;
     --verbose | -v)
         VERBOSE="-v"
-        shift # Move to the next argument
+        shift
         ;;
     --veryverbose | -vv)
         VERBOSE="-vv"
-        shift # Move to the next argument
+        shift
         ;;
     *)
-        break # Stop parsing when we reach the JSON argument
+        break
         ;;
     esac
 done
 
 JSON=$1
 shift
+if [[ "${JSON}" != /* ]]; then
+    JSON="${ORIG_PWD}/${JSON}"
+fi
 BENCHMARK=${*:-default}
 
-while true; do
-    # Call the benchmark script
-    "${SCRIPT_DIR}/benchmark.py" ${VERBOSE} ${CLEAR} ${LAUNCH} -j $JSON $BENCHMARK
-    EXIT_CODE=$?
+cd "${REPO_ROOT}"
 
-    # Do not clear the previous benchmark results
+while true; do
+    "${REPO_ROOT}/benchmark.py" ${VERBOSE} ${CLEAR} ${LAUNCH} -j "${JSON}" ${BENCHMARK}
+    EXIT_CODE=$?
     CLEAR=""
 
     if [[ $EXIT_CODE -eq 0 ]]; then
         echo "Benchmark succeeded."
         break
-    else
-        echo "Benchmark failed with exit code $EXIT_CODE. Retrying..."
     fi
+
+    echo "Benchmark failed with exit code $EXIT_CODE. Retrying..."
 
     if $NORETRY; then
         echo "Exiting without retrying."

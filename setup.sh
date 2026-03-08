@@ -1,17 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-SCRIPT_DIR="$(dirname $(readlink -f $0))"
+set -euo pipefail
 
-pushd $SCRIPT_DIR || exit 1
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Initialize the virtual environment
+pushd "${REPO_ROOT}" >/dev/null
 python3 -m venv .venv
+# shellcheck disable=SC1091
 source .venv/bin/activate
+pip install -r requirements.txt --upgrade
+popd >/dev/null
 
-# Install the dependencies
-pip3 install -r requirements.txt --upgrade
-
-popd
-
-# Keep the virtual environment active
 exec "$SHELL"
