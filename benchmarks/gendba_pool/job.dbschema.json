@@ -1,0 +1,283 @@
+{
+  "file_ending": "csv",
+  "delimiter": ",",
+  "format": "csv",
+  "null": "",
+  "csv_escape": "\"",
+  "tables": [
+    {
+      "name": "char_name",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "name", "type": "text not null" },
+        { "name": "imdb_index", "type": "character varying(12)" },
+        { "name": "imdb_id", "type": "integer" },
+        { "name": "name_pcode_nf", "type": "character varying(5)" },
+        { "name": "surname_pcode", "type": "character varying(5)" },
+        { "name": "md5sum", "type": "character varying(32)" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "company_name",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "name", "type": "text not null" },
+        { "name": "country_code", "type": "character varying(255)" },
+        { "name": "imdb_id", "type": "integer" },
+        { "name": "name_pcode_nf", "type": "character varying(5)" },
+        { "name": "name_pcode_sf", "type": "character varying(5)" },
+        { "name": "md5sum", "type": "character varying(32)" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "keyword",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "keyword", "type": "text not null" },
+        { "name": "phonetic_code", "type": "character varying(5)" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "name",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "name", "type": "text not null" },
+        { "name": "imdb_index", "type": "character varying(12)" },
+        { "name": "imdb_id", "type": "integer" },
+        { "name": "gender", "type": "character varying(1)" },
+        { "name": "name_pcode_cf", "type": "character varying(5)" },
+        { "name": "name_pcode_nf", "type": "character varying(5)" },
+        { "name": "surname_pcode", "type": "character varying(5)" },
+        { "name": "md5sum", "type": "character varying(32)" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "comp_cast_type",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "kind", "type": "character varying(32) not null" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "company_type",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "kind", "type": "character varying(32) not null" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "info_type",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "info", "type": "character varying(32) not null" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "kind_type",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "kind", "type": "character varying(32) not null" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "link_type",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "link", "type": "character varying(32) not null" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "role_type",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "role", "type": "character varying(32) not null" }
+      ],
+      "primary key": { "column": "id" }
+    },
+    {
+      "name": "title",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "title", "type": "text not null" },
+        { "name": "imdb_index", "type": "character varying(12)" },
+        { "name": "kind_id", "type": "integer not null" },
+        { "name": "production_year", "type": "integer" },
+        { "name": "imdb_id", "type": "integer" },
+        { "name": "phonetic_code", "type": "character varying(5)" },
+        { "name": "episode_of_id", "type": "integer" },
+        { "name": "season_nr", "type": "integer" },
+        { "name": "episode_nr", "type": "integer" },
+        { "name": "series_years", "type": "character varying(49)" },
+        { "name": "md5sum", "type": "character varying(32)" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [ { "column": "kind_id", "foreign table": "kind_type", "foreign column": "id" } ]
+    },
+    {
+      "name": "aka_name",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "person_id", "type": "integer not null" },
+        { "name": "name", "type": "text not null" },
+        { "name": "imdb_index", "type": "character varying(12)" },
+        { "name": "name_pcode_cf", "type": "character varying(5)" },
+        { "name": "name_pcode_nf", "type": "character varying(5)" },
+        { "name": "surname_pcode", "type": "character varying(5)" },
+        { "name": "md5sum", "type": "character varying(32)" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [ { "column": "person_id", "foreign table": "name", "foreign column": "id" } ]
+    },
+    {
+      "name": "aka_title",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer not null" },
+        { "name": "title", "type": "text not null" },
+        { "name": "imdb_index", "type": "character varying(12)" },
+        { "name": "kind_id", "type": "integer not null" },
+        { "name": "production_year", "type": "integer" },
+        { "name": "phonetic_code", "type": "character varying(5)" },
+        { "name": "episode_of_id", "type": "integer" },
+        { "name": "season_nr", "type": "integer" },
+        { "name": "episode_nr", "type": "integer" },
+        { "name": "note", "type": "text" },
+        { "name": "md5sum", "type": "character varying(32)" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [ { "column": "movie_id", "foreign table": "title", "foreign column": "id" } ]
+    },
+    {
+      "name": "cast_info",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "person_id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer not null" },
+        { "name": "person_role_id", "type": "integer" },
+        { "name": "note", "type": "text" },
+        { "name": "nr_order", "type": "integer" },
+        { "name": "role_id", "type": "integer not null" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "person_id", "foreign table": "name", "foreign column": "id" },
+        { "column": "person_role_id", "foreign table": "char_name", "foreign column": "id" },
+        { "column": "role_id", "foreign table": "role_type", "foreign column": "id" }
+      ]
+    },
+    {
+      "name": "complete_cast",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer" },
+        { "name": "subject_id", "type": "integer not null" },
+        { "name": "status_id", "type": "integer not null" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "subject_id", "foreign table": "comp_cast_type", "foreign column": "id" },
+        { "column": "status_id", "foreign table": "comp_cast_type", "foreign column": "id" }
+      ]
+    },
+    {
+      "name": "movie_companies",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer not null" },
+        { "name": "company_id", "type": "integer not null" },
+        { "name": "company_type_id", "type": "integer not null" },
+        { "name": "note", "type": "text" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "company_id", "foreign table": "company_name", "foreign column": "id" },
+        { "column": "company_type_id", "foreign table": "company_type", "foreign column": "id" }
+      ]
+    },
+    {
+      "name": "movie_info",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer not null" },
+        { "name": "info_type_id", "type": "integer not null" },
+        { "name": "info", "type": "text not null" },
+        { "name": "note", "type": "text" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "info_type_id", "foreign table": "info_type", "foreign column": "id" }
+      ]
+    },
+    {
+      "name": "movie_info_idx",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer not null" },
+        { "name": "info_type_id", "type": "integer not null" },
+        { "name": "info", "type": "text not null" },
+        { "name": "note", "type": "text" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "info_type_id", "foreign table": "info_type", "foreign column": "id" }
+      ]
+    },
+    {
+      "name": "movie_keyword",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer not null" },
+        { "name": "keyword_id", "type": "integer not null" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "keyword_id", "foreign table": "keyword", "foreign column": "id" }
+      ]
+    },
+    {
+      "name": "movie_link",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "movie_id", "type": "integer not null" },
+        { "name": "linked_movie_id", "type": "integer not null" },
+        { "name": "link_type_id", "type": "integer not null" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "linked_movie_id", "foreign table": "title", "foreign column": "id" },
+        { "column": "link_type_id", "foreign table": "link_type", "foreign column": "id" }
+      ]
+    },
+    {
+      "name": "person_info",
+      "columns": [
+        { "name": "id", "type": "integer not null" },
+        { "name": "person_id", "type": "integer not null" },
+        { "name": "info_type_id", "type": "integer not null" },
+        { "name": "info", "type": "text not null" },
+        { "name": "note", "type": "text" }
+      ],
+      "primary key": { "column": "id" },
+      "foreign keys": [
+        { "column": "person_id", "foreign table": "name", "foreign column": "id" },
+        { "column": "info_type_id", "foreign table": "info_type", "foreign column": "id" }
+      ]
+    }
+  ]
+}

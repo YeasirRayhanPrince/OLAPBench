@@ -1,7 +1,7 @@
-title: JOB GenDBA Training Data
+title: SQLStorm GenDBA Training Data
 repetitions: 1
 warmup: 0
-timeout: 60
+timeout: 0
 global_timeout: 0
 fetch_result: true
 query_plan:
@@ -36,5 +36,4 @@ systems:
     parameter:
       version: "latest"
 benchmarks:
-  - name: jo
-  b
+  - name: sqlstorm

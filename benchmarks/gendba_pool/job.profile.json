@@ -1,0 +1,1367 @@
+{
+  "benchmark": "job",
+  "dataset_name": "gendba_pool",
+  "generation_mode": "auto_profile",
+  "nested": [
+    {
+      "cases": [
+        {
+          "bucket": "medium",
+          "candidate_id": "nested::kind_type::episode_of_id_tail::033f8435",
+          "estimated_selectivity": 0.125,
+          "family_name": "kind_type_has_title",
+          "inner_from": "title AS t",
+          "inner_key": "t.kind_id",
+          "inner_predicates": [
+            {
+              "column": "t.episode_of_id",
+              "operator": ">=",
+              "value": 1314643
+            }
+          ],
+          "name": "episode_of_id_tail",
+          "observed_rows": 1,
+          "observed_selectivity": 0.125,
+          "outer_alias": "kt",
+          "outer_key": "kt.id",
+          "outer_predicates": [],
+          "outer_table": "kind_type",
+          "related_tables": [
+            "kind_type",
+            "title"
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "nested::kind_type::id_mid_band::e9d89a8f",
+          "estimated_selectivity": 0.25,
+          "family_name": "kind_type_has_title",
+          "inner_from": "title AS t",
+          "inner_key": "t.kind_id",
+          "inner_predicates": [
+            {
+              "column": "t.id",
+              "operator": "between",
+              "value": [
+                507728,
+                1255545
+              ]
+            }
+          ],
+          "name": "id_mid_band",
+          "observed_rows": 2,
+          "observed_selectivity": 0.25,
+          "outer_alias": "kt",
+          "outer_key": "kt.id",
+          "outer_predicates": [],
+          "outer_table": "kind_type",
+          "related_tables": [
+            "kind_type",
+            "title"
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "nested::kind_type::id_upper_band::1737b33b",
+          "estimated_selectivity": 0.75,
+          "family_name": "kind_type_has_title",
+          "inner_from": "title AS t",
+          "inner_key": "t.kind_id",
+          "inner_predicates": [
+            {
+              "column": "t.id",
+              "operator": "between",
+              "value": [
+                1255545,
+                2016379
+              ]
+            }
+          ],
+          "name": "id_upper_band",
+          "observed_rows": 6,
+          "observed_selectivity": 0.75,
+          "outer_alias": "kt",
+          "outer_key": "kt.id",
+          "outer_predicates": [],
+          "outer_table": "kind_type",
+          "related_tables": [
+            "kind_type",
+            "title"
+          ],
+          "source": "probe"
+        }
+      ],
+      "inner_from": "title AS t",
+      "inner_key": "t.kind_id",
+      "name": "kind_type_has_title",
+      "outer_alias": "kt",
+      "outer_key": "kt.id",
+      "outer_table": "kind_type"
+    },
+    {
+      "cases": [
+        {
+          "bucket": "very_low",
+          "candidate_id": "nested::name::id_mid_band::4bf265d0",
+          "estimated_selectivity": 0.00891615602769148,
+          "family_name": "name_has_aka_name",
+          "inner_from": "aka_name AS an",
+          "inner_key": "an.person_id",
+          "inner_predicates": [
+            {
+              "column": "an.id",
+              "operator": "between",
+              "value": [
+                179128,
+                448042
+              ]
+            }
+          ],
+          "name": "id_mid_band",
+          "observed_rows": 37158,
+          "observed_selectivity": 0.00891615602769148,
+          "outer_alias": "n",
+          "outer_key": "n.id",
+          "outer_predicates": [
+            {
+              "column": "n.id",
+              "operator": "between",
+              "value": [
+                829758,
+                2065539
+              ]
+            }
+          ],
+          "outer_table": "name",
+          "related_tables": [
+            "aka_name",
+            "name"
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "low",
+          "candidate_id": "nested::name::id_upper_band::5b9e51bd",
+          "estimated_selectivity": 0.04542397332111815,
+          "family_name": "name_has_aka_name",
+          "inner_from": "aka_name AS an",
+          "inner_key": "an.person_id",
+          "inner_predicates": [
+            {
+              "column": "an.id",
+              "operator": "between",
+              "value": [
+                448042,
+                718784
+              ]
+            }
+          ],
+          "name": "id_upper_band",
+          "observed_rows": 189304,
+          "observed_selectivity": 0.04542397332111815,
+          "outer_alias": "n",
+          "outer_key": "n.id",
+          "outer_predicates": [],
+          "outer_table": "name",
+          "related_tables": [
+            "aka_name",
+            "name"
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "low",
+          "candidate_id": "nested::name::name_pcode_nf_missing::38c0f5ae",
+          "estimated_selectivity": 0.02070166438271852,
+          "family_name": "name_has_aka_name",
+          "inner_from": "aka_name AS an",
+          "inner_key": "an.person_id",
+          "inner_predicates": [
+            {
+              "column": "an.name_pcode_nf",
+              "operator": "is_null"
+            }
+          ],
+          "name": "name_pcode_nf_missing",
+          "observed_rows": 86274,
+          "observed_selectivity": 0.02070166438271852,
+          "outer_alias": "n",
+          "outer_key": "n.id",
+          "outer_predicates": [],
+          "outer_table": "name",
+          "related_tables": [
+            "aka_name",
+            "name"
+          ],
+          "source": "probe"
+        }
+      ],
+      "inner_from": "aka_name AS an",
+      "inner_key": "an.person_id",
+      "name": "name_has_aka_name",
+      "outer_alias": "n",
+      "outer_key": "n.id",
+      "outer_table": "name"
+    },
+    {
+      "cases": [
+        {
+          "bucket": "low",
+          "candidate_id": "nested::name::id_mid_band::93ba12e8",
+          "estimated_selectivity": 0.025202933851566807,
+          "family_name": "name_has_info_type",
+          "inner_from": "person_info AS pi JOIN info_type AS it ON pi.info_type_id = it.id",
+          "inner_key": "pi.person_id",
+          "inner_predicates": [
+            {
+              "column": "it.id",
+              "operator": "between",
+              "value": [
+                23,
+                57
+              ]
+            }
+          ],
+          "name": "id_mid_band",
+          "observed_rows": 105033,
+          "observed_selectivity": 0.025202933851566807,
+          "outer_alias": "n",
+          "outer_key": "n.id",
+          "outer_predicates": [
+            {
+              "column": "n.id",
+              "operator": "between",
+              "value": [
+                2065539,
+                3351366
+              ]
+            }
+          ],
+          "outer_table": "name",
+          "related_tables": [
+            "info_type",
+            "name",
+            "person_info"
+          ],
+          "source": "probe"
+        }
+      ],
+      "inner_from": "person_info AS pi JOIN info_type AS it ON pi.info_type_id = it.id",
+      "inner_key": "pi.person_id",
+      "name": "name_has_info_type",
+      "outer_alias": "n",
+      "outer_key": "n.id",
+      "outer_table": "name"
+    },
+    {
+      "cases": [
+        {
+          "bucket": "low",
+          "candidate_id": "nested::title::movie_id_mid_band::0a4c4edd",
+          "estimated_selectivity": 0.024278639551353016,
+          "family_name": "title_has_aka_title",
+          "inner_from": "aka_title AS at",
+          "inner_key": "at.movie_id",
+          "inner_predicates": [
+            {
+              "column": "at.movie_id",
+              "operator": "between",
+              "value": [
+                1785560,
+                2051432
+              ]
+            }
+          ],
+          "name": "movie_id_mid_band",
+          "observed_rows": 61384,
+          "observed_selectivity": 0.024278639551353016,
+          "outer_alias": "t",
+          "outer_key": "t.id",
+          "outer_predicates": [],
+          "outer_table": "title",
+          "related_tables": [
+            "aka_title",
+            "title"
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "low",
+          "candidate_id": "nested::title::note_international_english_title::ad36e96e",
+          "estimated_selectivity": 0.01276898864974392,
+          "family_name": "title_has_aka_title",
+          "inner_from": "aka_title AS at",
+          "inner_key": "at.movie_id",
+          "inner_predicates": [
+            {
+              "column": "at.note",
+              "operator": "=",
+              "value": "(International: English title)"
+            }
+          ],
+          "name": "note_international_english_title",
+          "observed_rows": 32284,
+          "observed_selectivity": 0.01276898864974392,
+          "outer_alias": "t",
+          "outer_key": "t.id",
+          "outer_predicates": [],
+          "outer_table": "title",
+          "related_tables": [
+            "aka_title",
+            "title"
+          ],
+          "source": "probe"
+        }
+      ],
+      "inner_from": "aka_title AS at",
+      "inner_key": "at.movie_id",
+      "name": "title_has_aka_title",
+      "outer_alias": "t",
+      "outer_key": "t.id",
+      "outer_table": "title"
+    },
+    {
+      "cases": [
+        {
+          "bucket": "very_low",
+          "candidate_id": "nested::title::id_mid_band::93ba12e8",
+          "estimated_selectivity": 7.514892341256799e-05,
+          "family_name": "title_has_info_type",
+          "inner_from": "movie_info AS mi JOIN info_type AS it ON mi.info_type_id = it.id",
+          "inner_key": "mi.movie_id",
+          "inner_predicates": [
+            {
+              "column": "it.id",
+              "operator": "between",
+              "value": [
+                23,
+                57
+              ]
+            }
+          ],
+          "name": "id_mid_band",
+          "observed_rows": 190,
+          "observed_selectivity": 7.514892341256799e-05,
+          "outer_alias": "t",
+          "outer_key": "t.id",
+          "outer_predicates": [
+            {
+              "column": "t.id",
+              "operator": "between",
+              "value": [
+                507728,
+                1255545
+              ]
+            }
+          ],
+          "outer_table": "title",
+          "related_tables": [
+            "info_type",
+            "movie_info",
+            "title"
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "nested::title::id_tail::7af3dfca",
+          "estimated_selectivity": 0.17449263599878653,
+          "family_name": "title_has_info_type",
+          "inner_from": "movie_info AS mi JOIN info_type AS it ON mi.info_type_id = it.id",
+          "inner_key": "mi.movie_id",
+          "inner_predicates": [
+            {
+              "column": "it.id",
+              "operator": ">=",
+              "value": 90
+            }
+          ],
+          "name": "id_tail",
+          "observed_rows": 441172,
+          "observed_selectivity": 0.17449263599878653,
+          "outer_alias": "t",
+          "outer_key": "t.id",
+          "outer_predicates": [],
+          "outer_table": "title",
+          "related_tables": [
+            "info_type",
+            "movie_info",
+            "title"
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "very_low",
+          "candidate_id": "nested::title::id_upper_band::bcda07ea",
+          "estimated_selectivity": 0.008494992510816502,
+          "family_name": "title_has_info_type",
+          "inner_from": "movie_info AS mi JOIN info_type AS it ON mi.info_type_id = it.id",
+          "inner_key": "mi.movie_id",
+          "inner_predicates": [
+            {
+              "column": "it.id",
+              "operator": "between",
+              "value": [
+                57,
+                90
+              ]
+            }
+          ],
+          "name": "id_upper_band",
+          "observed_rows": 21478,
+          "observed_selectivity": 0.008494992510816502,
+          "outer_alias": "t",
+          "outer_key": "t.id",
+          "outer_predicates": [],
+          "outer_table": "title",
+          "related_tables": [
+            "info_type",
+            "movie_info",
+            "title"
+          ],
+          "source": "probe"
+        }
+      ],
+      "inner_from": "movie_info AS mi JOIN info_type AS it ON mi.info_type_id = it.id",
+      "inner_key": "mi.movie_id",
+      "name": "title_has_info_type",
+      "outer_alias": "t",
+      "outer_key": "t.id",
+      "outer_table": "title"
+    }
+  ],
+  "nested_shapes": [
+    "in",
+    "exists",
+    "scalar_count",
+    "derived_join",
+    "cte_in",
+    "cte_exists"
+  ],
+  "single_table": [
+    {
+      "alias": "an",
+      "cases": [
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::aka_name::id_low_band::90b757f5",
+          "column": "id",
+          "estimated_selectivity": 0.2,
+          "kind": "range",
+          "name": "id_low_band",
+          "observed_rows": 179128,
+          "observed_selectivity": 0.19873455499182885,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "<=",
+              "value": 179128
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::aka_name::id_mid_band::f47ece30",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_mid_band",
+          "observed_rows": 268915,
+          "observed_selectivity": 0.29834924107692634,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                179128,
+                448042
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::aka_name::id_upper_band::0777c3f9",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_upper_band",
+          "observed_rows": 270743,
+          "observed_selectivity": 0.300377325834893,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                448042,
+                718784
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::aka_name::name_pcode_nf_missing::82291a0a",
+          "column": "name_pcode_nf",
+          "estimated_selectivity": 0.1212,
+          "kind": "is_null",
+          "name": "name_pcode_nf_missing",
+          "observed_rows": 109268,
+          "observed_selectivity": 0.12122798978857105,
+          "predicates": [
+            {
+              "column": "name_pcode_nf",
+              "operator": "is_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::aka_name::name_pcode_nf_present::e48a5bac",
+          "column": "name_pcode_nf",
+          "estimated_selectivity": 0.8788,
+          "kind": "is_not_null",
+          "name": "name_pcode_nf_present",
+          "observed_rows": 792075,
+          "observed_selectivity": 0.8787720102114289,
+          "predicates": [
+            {
+              "column": "name_pcode_nf",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::aka_name::surname_pcode_present::9d27d70f",
+          "column": "surname_pcode",
+          "estimated_selectivity": 0.6903,
+          "kind": "is_not_null",
+          "name": "surname_pcode_present",
+          "observed_rows": 621097,
+          "observed_selectivity": 0.6890795180081278,
+          "predicates": [
+            {
+              "column": "surname_pcode",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        }
+      ],
+      "table": "aka_name"
+    },
+    {
+      "alias": "at",
+      "cases": [
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::aka_title::kind_id_1::c05a427a",
+          "column": "kind_id",
+          "estimated_selectivity": 0.8146333,
+          "kind": "equality",
+          "name": "kind_id_1",
+          "observed_rows": 293275,
+          "observed_selectivity": 0.8113353178116147,
+          "predicates": [
+            {
+              "column": "kind_id",
+              "operator": "=",
+              "value": 1
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::aka_title::kind_id_top_values::da2acc31",
+          "column": "kind_id",
+          "estimated_selectivity": 0.887766635,
+          "kind": "membership",
+          "name": "kind_id_top_values",
+          "observed_rows": 320214,
+          "observed_selectivity": 0.8858611455382436,
+          "predicates": [
+            {
+              "column": "kind_id",
+              "operator": "in",
+              "value": [
+                1,
+                3
+              ]
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::aka_title::movie_id_mid_band::09e75d51",
+          "column": "movie_id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "movie_id_mid_band",
+          "observed_rows": 108112,
+          "observed_selectivity": 0.2990881728045326,
+          "predicates": [
+            {
+              "column": "movie_id",
+              "operator": "between",
+              "value": [
+                1785560,
+                2051432
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::aka_title::movie_id_upper_band::37f54efa",
+          "column": "movie_id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "movie_id_upper_band",
+          "observed_rows": 108892,
+          "observed_selectivity": 0.30124601628895187,
+          "predicates": [
+            {
+              "column": "movie_id",
+              "operator": "between",
+              "value": [
+                2051432,
+                2336826
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::aka_title::note_international_english_title::8a19b7be",
+          "column": "note",
+          "estimated_selectivity": 0.0929,
+          "kind": "equality",
+          "name": "note_international_english_title",
+          "observed_rows": 33059,
+          "observed_selectivity": 0.09145659968130311,
+          "predicates": [
+            {
+              "column": "note",
+              "operator": "=",
+              "value": "(International: English title)"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::aka_title::note_italy::5ccce21d",
+          "column": "note",
+          "estimated_selectivity": 0.109066665,
+          "kind": "equality",
+          "name": "note_italy",
+          "observed_rows": 39538,
+          "observed_selectivity": 0.10938053293201133,
+          "predicates": [
+            {
+              "column": "note",
+              "operator": "=",
+              "value": "(Italy)"
+            }
+          ],
+          "source": "pg_stats"
+        }
+      ],
+      "table": "aka_title"
+    },
+    {
+      "alias": "cn",
+      "cases": [
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::char_name::id_low_band::29ed403c",
+          "column": "id",
+          "estimated_selectivity": 0.2,
+          "kind": "range",
+          "name": "id_low_band",
+          "observed_rows": 621234,
+          "observed_selectivity": 0.19782386551260867,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "<=",
+              "value": 621234
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::char_name::id_mid_band::68b656d9",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_mid_band",
+          "observed_rows": 946022,
+          "observed_selectivity": 0.3012483684086336,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                621234,
+                1567255
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::char_name::id_upper_band::b9cda283",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_upper_band",
+          "observed_rows": 947463,
+          "observed_selectivity": 0.30170723606591515,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                1567255,
+                2514717
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::char_name::name_pcode_nf_present::e48a5bac",
+          "column": "name_pcode_nf",
+          "estimated_selectivity": 0.99983333334,
+          "kind": "is_not_null",
+          "name": "name_pcode_nf_present",
+          "observed_rows": 3139851,
+          "observed_selectivity": 0.9998446027642238,
+          "predicates": [
+            {
+              "column": "name_pcode_nf",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::char_name::surname_pcode_missing::aa9785e9",
+          "column": "surname_pcode",
+          "estimated_selectivity": 0.1508,
+          "kind": "is_null",
+          "name": "surname_pcode_missing",
+          "observed_rows": 470680,
+          "observed_selectivity": 0.1498819076539189,
+          "predicates": [
+            {
+              "column": "surname_pcode",
+              "operator": "is_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::char_name::surname_pcode_present::9d27d70f",
+          "column": "surname_pcode",
+          "estimated_selectivity": 0.8492,
+          "kind": "is_not_null",
+          "name": "surname_pcode_present",
+          "observed_rows": 2669659,
+          "observed_selectivity": 0.8501180923460812,
+          "predicates": [
+            {
+              "column": "surname_pcode",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        }
+      ],
+      "table": "char_name"
+    },
+    {
+      "alias": "cn2",
+      "cases": [
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::company_name::country_code_missing::d2fc1db1",
+          "column": "country_code",
+          "estimated_selectivity": 0.10643333,
+          "kind": "is_null",
+          "name": "country_code_missing",
+          "observed_rows": 23924,
+          "observed_selectivity": 0.10180555496453146,
+          "predicates": [
+            {
+              "column": "country_code",
+              "operator": "is_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::company_name::country_code_present::80cf4e60",
+          "column": "country_code",
+          "estimated_selectivity": 0.89356667,
+          "kind": "is_not_null",
+          "name": "country_code_present",
+          "observed_rows": 211073,
+          "observed_selectivity": 0.8981944450354685,
+          "predicates": [
+            {
+              "column": "country_code",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::company_name::id_mid_band::f39b9236",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_mid_band",
+          "observed_rows": 71133,
+          "observed_selectivity": 0.3026974812444414,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                47467,
+                118599
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::company_name::id_upper_band::249fe4c2",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_upper_band",
+          "observed_rows": 70014,
+          "observed_selectivity": 0.2979357183283191,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                118599,
+                188612
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::company_name::name_pcode_sf_missing::5f1ddd5c",
+          "column": "name_pcode_sf",
+          "estimated_selectivity": 0.10643333,
+          "kind": "is_null",
+          "name": "name_pcode_sf_missing",
+          "observed_rows": 23924,
+          "observed_selectivity": 0.10180555496453146,
+          "predicates": [
+            {
+              "column": "name_pcode_sf",
+              "operator": "is_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::company_name::name_pcode_sf_present::5e598501",
+          "column": "name_pcode_sf",
+          "estimated_selectivity": 0.89356667,
+          "kind": "is_not_null",
+          "name": "name_pcode_sf_present",
+          "observed_rows": 211073,
+          "observed_selectivity": 0.8981944450354685,
+          "predicates": [
+            {
+              "column": "name_pcode_sf",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        }
+      ],
+      "table": "company_name"
+    },
+    {
+      "alias": "it",
+      "cases": [
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::info_type::id_low_band::b924e35c",
+          "column": "id",
+          "estimated_selectivity": 0.2,
+          "kind": "range",
+          "name": "id_low_band",
+          "observed_rows": 23,
+          "observed_selectivity": 0.20353982300884957,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "<=",
+              "value": 23
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::info_type::id_mid_band::3e202beb",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_mid_band",
+          "observed_rows": 35,
+          "observed_selectivity": 0.30973451327433627,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                23,
+                57
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::info_type::id_tail::13b9b655",
+          "column": "id",
+          "estimated_selectivity": 0.2,
+          "kind": "range",
+          "name": "id_tail",
+          "observed_rows": 24,
+          "observed_selectivity": 0.21238938053097345,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": ">=",
+              "value": 90
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::info_type::id_upper_band::05dae7c5",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_upper_band",
+          "observed_rows": 34,
+          "observed_selectivity": 0.3008849557522124,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                57,
+                90
+              ]
+            }
+          ],
+          "source": "probe"
+        }
+      ],
+      "table": "info_type"
+    },
+    {
+      "alias": "k",
+      "cases": [
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::keyword::id_mid_band::a8f049e1",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_mid_band",
+          "observed_rows": 40178,
+          "observed_selectivity": 0.29945591413877914,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                26991,
+                67168
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::keyword::id_upper_band::a824a7f2",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_upper_band",
+          "observed_rows": 39905,
+          "observed_selectivity": 0.29742118208243273,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                67168,
+                107072
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::keyword::phonetic_code_present::dbe8c5fb",
+          "column": "phonetic_code",
+          "estimated_selectivity": 0.99966666667,
+          "kind": "is_not_null",
+          "name": "phonetic_code_present",
+          "observed_rows": 134132,
+          "observed_selectivity": 0.9997167772229262,
+          "predicates": [
+            {
+              "column": "phonetic_code",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "low",
+          "candidate_id": "single_table::keyword::phonetic_code_r1652::7b9e58da",
+          "column": "phonetic_code",
+          "estimated_selectivity": 0.05733333,
+          "kind": "equality",
+          "name": "phonetic_code_r1652",
+          "observed_rows": 7596,
+          "observed_selectivity": 0.05661474249086979,
+          "predicates": [
+            {
+              "column": "phonetic_code",
+              "operator": "=",
+              "value": "R1652"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_low",
+          "candidate_id": "single_table::keyword::phonetic_code_s5252::0b031cc0",
+          "column": "phonetic_code",
+          "estimated_selectivity": 0.0025333334,
+          "kind": "equality",
+          "name": "phonetic_code_s5252",
+          "observed_rows": 313,
+          "observed_selectivity": 0.0023328612953715435,
+          "predicates": [
+            {
+              "column": "phonetic_code",
+              "operator": "=",
+              "value": "S5252"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::keyword::phonetic_code_top_values::b0894951",
+          "column": "phonetic_code",
+          "estimated_selectivity": 0.061033330000000004,
+          "kind": "membership",
+          "name": "phonetic_code_top_values",
+          "observed_rows": 8064,
+          "observed_selectivity": 0.060102854587463665,
+          "predicates": [
+            {
+              "column": "phonetic_code",
+              "operator": "in",
+              "value": [
+                "R1652",
+                "Y6"
+              ]
+            }
+          ],
+          "source": "pg_stats"
+        }
+      ],
+      "table": "keyword"
+    },
+    {
+      "alias": "n",
+      "cases": [
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::name::id_mid_band::aa32da1e",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_mid_band",
+          "observed_rows": 1235782,
+          "observed_selectivity": 0.2965290146997318,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                829758,
+                2065539
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::name::id_upper_band::826bf9b1",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_upper_band",
+          "observed_rows": 1285828,
+          "observed_selectivity": 0.3085376789056053,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                2065539,
+                3351366
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::name::imdb_index_i::01f76c00",
+          "column": "imdb_index",
+          "estimated_selectivity": 0.06626666,
+          "kind": "equality",
+          "name": "imdb_index_i",
+          "observed_rows": 266152,
+          "observed_selectivity": 0.0638638451768702,
+          "predicates": [
+            {
+              "column": "imdb_index",
+              "operator": "=",
+              "value": "I"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::name::imdb_index_missing::d2a37156",
+          "column": "imdb_index",
+          "estimated_selectivity": 0.78063333,
+          "kind": "is_null",
+          "name": "imdb_index_missing",
+          "observed_rows": 3278462,
+          "observed_selectivity": 0.7866752441696935,
+          "predicates": [
+            {
+              "column": "imdb_index",
+              "operator": "is_null"
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::name::imdb_index_top_values::010cc93e",
+          "column": "imdb_index",
+          "estimated_selectivity": 0.12186666,
+          "kind": "membership",
+          "name": "imdb_index_top_values",
+          "observed_rows": 493384,
+          "observed_selectivity": 0.1183887379720796,
+          "predicates": [
+            {
+              "column": "imdb_index",
+              "operator": "in",
+              "value": [
+                "I",
+                "II"
+              ]
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::name::surname_pcode_present::9d27d70f",
+          "column": "surname_pcode",
+          "estimated_selectivity": 0.7762,
+          "kind": "is_not_null",
+          "name": "surname_pcode_present",
+          "observed_rows": 3231581,
+          "observed_selectivity": 0.7754260297142813,
+          "predicates": [
+            {
+              "column": "surname_pcode",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        }
+      ],
+      "table": "name"
+    },
+    {
+      "alias": "t",
+      "cases": [
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::title::episode_of_id_low_band::1212831b",
+          "column": "episode_of_id",
+          "estimated_selectivity": 0.2,
+          "kind": "range",
+          "name": "episode_of_id_low_band",
+          "observed_rows": 311249,
+          "observed_selectivity": 0.12310540664862302,
+          "predicates": [
+            {
+              "column": "episode_of_id",
+              "operator": "<=",
+              "value": 328784
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "medium",
+          "candidate_id": "single_table::title::episode_of_id_tail::2ed52237",
+          "column": "episode_of_id",
+          "estimated_selectivity": 0.2,
+          "kind": "range",
+          "name": "episode_of_id_tail",
+          "observed_rows": 302673,
+          "observed_selectivity": 0.11971342155816941,
+          "predicates": [
+            {
+              "column": "episode_of_id",
+              "operator": ">=",
+              "value": 1314643
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::title::id_mid_band::4b365db2",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_mid_band",
+          "observed_rows": 747818,
+          "observed_selectivity": 0.2957774610975777,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                507728,
+                1255545
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "high",
+          "candidate_id": "single_table::title::id_upper_band::90f16820",
+          "column": "id",
+          "estimated_selectivity": 0.3,
+          "kind": "range",
+          "name": "id_upper_band",
+          "observed_rows": 760835,
+          "observed_selectivity": 0.3009259533926377,
+          "predicates": [
+            {
+              "column": "id",
+              "operator": "between",
+              "value": [
+                1255545,
+                2016379
+              ]
+            }
+          ],
+          "source": "probe"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::title::kind_id_top_values::81493b98",
+          "column": "kind_id",
+          "estimated_selectivity": 0.8744,
+          "kind": "membership",
+          "name": "kind_id_top_values",
+          "observed_rows": 2206089,
+          "observed_selectivity": 0.8725537542226773,
+          "predicates": [
+            {
+              "column": "kind_id",
+              "operator": "in",
+              "value": [
+                7,
+                1
+              ]
+            }
+          ],
+          "source": "pg_stats"
+        },
+        {
+          "bucket": "very_high",
+          "candidate_id": "single_table::title::phonetic_code_present::dbe8c5fb",
+          "column": "phonetic_code",
+          "estimated_selectivity": 0.71543333,
+          "kind": "is_not_null",
+          "name": "phonetic_code_present",
+          "observed_rows": 1810013,
+          "observed_selectivity": 0.7158975174355391,
+          "predicates": [
+            {
+              "column": "phonetic_code",
+              "operator": "is_not_null"
+            }
+          ],
+          "source": "pg_stats"
+        }
+      ],
+      "table": "title"
+    }
+  ]
+}
