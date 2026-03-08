@@ -1,7 +1,7 @@
 title: SQLStorm
 repetitions: 1
 warmup: 0
-timeout: 100
+timeout: 0
 query_seed: 42
 fetch_result: false
 output: results/sqlstorm/umbradev/

@@ -157,6 +157,8 @@ class BenchmarkDescription:
 def benchmarks() -> dict[str, BenchmarkDescription]:
     from benchmarks.clickbench import clickbench
     from benchmarks.job import job
+    from benchmarks.gendba_pool import gendba_pool
+    from benchmarks.sqlstorm import sqlstorm
     from benchmarks.ssb import ssb
     from benchmarks.tpcds import tpcds
     from benchmarks.tpch import tpch
@@ -165,6 +167,8 @@ def benchmarks() -> dict[str, BenchmarkDescription]:
     benchmark_list = [
         clickbench.ClickBenchDescription,
         job.JOBDescription,
+        gendba_pool.GenDBAPoolDescription,
+        sqlstorm.SQLStormDescription,
         ssb.SSBDescription,
         stackoverflow.StackOverflowDescription,
         tpcds.TPCDSDescription,

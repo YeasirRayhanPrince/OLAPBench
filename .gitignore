@@ -8,3 +8,5 @@ data/
 
 **/*_sqlstorm_*
 test/**/*.csv
+SQLStorm/
+benchmarks/gendba_pool/queries*
