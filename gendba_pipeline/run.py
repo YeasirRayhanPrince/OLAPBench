@@ -84,6 +84,16 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]):
             file.write("\n")
 
 
+def _append_jsonl(path: Path, rows: list[dict[str, Any]]):
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as file:
+        for row in rows:
+            file.write(_dumps(row))
+            file.write("\n")
+
+
 def _load_pipeline_spec(spec_path: Path) -> dict[str, Any]:
     schema_path = Path(__file__).resolve().parent / "dataset_pipeline.schema.json"
     schema = _loads(schema_path.read_text())
@@ -396,14 +406,12 @@ def _run_physical_group(
     return _collect_physical_tokens(result_csv_path)
 
 
-def _build_training_and_manifest_rows(
+def _iter_training_and_manifest_rows(
     query_entries: list[QueryEntry],
     logical_records: dict[str, dict[str, Any]],
     physical_tokens_by_engine: dict[str, dict[str, dict[str, Any]]],
     physical_sources_by_engine: dict[str, dict[str, dict[str, Any]]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    training_rows: list[dict[str, Any]] = []
-    manifest_rows: list[dict[str, Any]] = []
+):
     next_id = 1
 
     for entry in query_entries:
@@ -424,37 +432,33 @@ def _build_training_and_manifest_rows(
             if source is not None:
                 physical_source_map[engine_key] = source
 
-        training_rows.append(
-            {
-                "id": next_id,
-                "schema": entry.schema,
-                "sql_file_name": entry.query_id,
-                "sql": entry.sql,
-                "ir_logical_token": logical_record["logical_tokenized_plan"],
-                "ir_physical_token": physical_token_map,
-            }
-        )
+        training_row = {
+            "id": next_id,
+            "schema": entry.schema,
+            "sql_file_name": entry.query_id,
+            "sql": entry.sql,
+            "ir_logical_token": logical_record["logical_tokenized_plan"],
+            "ir_physical_token": physical_token_map,
+        }
 
-        manifest_rows.append(
-            {
-                "id": next_id,
-                "query_key": entry.query_id,
-                "schema": entry.schema,
-                "workload": entry.workload,
-                "query_set": entry.query_set,
-                "sql_source_path": entry.sql_source_path,
-                "logical_source": {
-                    "plan_json_path": logical_record.get("plan_json_path"),
-                    "plan_text_path": logical_record.get("plan_text_path"),
-                    "global_mapping_path": logical_record.get("global_mapping_path"),
-                    "annotated_plan_path": logical_record.get("annotated_plan_path"),
-                },
-                "physical_sources": physical_source_map,
-            }
-        )
+        manifest_row = {
+            "id": next_id,
+            "query_key": entry.query_id,
+            "schema": entry.schema,
+            "workload": entry.workload,
+            "query_set": entry.query_set,
+            "sql_source_path": entry.sql_source_path,
+            "logical_source": {
+                "plan_json_path": logical_record.get("plan_json_path"),
+                "plan_text_path": logical_record.get("plan_text_path"),
+                "global_mapping_path": logical_record.get("global_mapping_path"),
+                "annotated_plan_path": logical_record.get("annotated_plan_path"),
+            },
+            "physical_sources": physical_source_map,
+        }
+
+        yield training_row, manifest_row
         next_id += 1
-
-    return training_rows, manifest_rows
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
@@ -537,21 +541,44 @@ def run_pipeline(args: argparse.Namespace) -> int:
             for query_id, source in sources.items():
                 physical_sources_by_engine[engine_key][f"{group.group_key}:{query_id}"] = source
 
-    training_rows, manifest_rows = _build_training_and_manifest_rows(
-        query_entries=query_entries,
-        logical_records=logical_records,
-        physical_tokens_by_engine=physical_tokens_by_engine,
-        physical_sources_by_engine=physical_sources_by_engine,
-    )
-
     export_cfg = spec.get("export", {})
     training_name = export_cfg.get("training_jsonl_name") or export_cfg.get("jsonl_name") or "training.jsonl"
     manifest_name = export_cfg.get("manifest_jsonl_name") or "training_manifest.jsonl"
     training_path = dataset_root / training_name
     manifest_path = dataset_root / manifest_name
 
-    _write_jsonl(training_path, training_rows)
-    _write_jsonl(manifest_path, manifest_rows)
+    training_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    training_path.write_text("")
+    manifest_path.write_text("")
+
+    batch_size = 100
+    training_batch: list[dict[str, Any]] = []
+    manifest_batch: list[dict[str, Any]] = []
+    written_rows = 0
+
+    for training_row, manifest_row in _iter_training_and_manifest_rows(
+        query_entries=query_entries,
+        logical_records=logical_records,
+        physical_tokens_by_engine=physical_tokens_by_engine,
+        physical_sources_by_engine=physical_sources_by_engine,
+    ):
+        training_batch.append(training_row)
+        manifest_batch.append(manifest_row)
+
+        if len(training_batch) >= batch_size:
+            _append_jsonl(training_path, training_batch)
+            _append_jsonl(manifest_path, manifest_batch)
+            written_rows += len(training_batch)
+            training_batch.clear()
+            manifest_batch.clear()
+            print(f"Flushed {written_rows} rows to JSONL outputs")
+
+    if training_batch:
+        _append_jsonl(training_path, training_batch)
+        _append_jsonl(manifest_path, manifest_batch)
+        written_rows += len(training_batch)
+        print(f"Flushed {written_rows} rows to JSONL outputs")
 
     print(f"Training JSONL: {training_path}")
     print(f"Manifest JSONL: {manifest_path}")
