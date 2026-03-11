@@ -179,7 +179,10 @@ python3 "${SCRIPT_DIR}/export.py" \
   --schema-path  "${SCHEMA_PATH}" \
   --dbms         "${DBMS}@${VERSION}" \
   --out-training "${OUT_DIR}/${RUN_ID}.training.jsonl" \
-  --out-manifest "${OUT_DIR}/${RUN_ID}.manifest.jsonl"
+  --out-manifest "${OUT_DIR}/${RUN_ID}.manifest.jsonl" \
+  --workload     "${BENCHMARK}" \
+  --query-set    "${QUERY_DIR:-queries}" \
+  --sql-dir      "${QUERIES_PATH}"
 
 echo ""
 echo "==> Done! Outputs in: ${OUT_DIR}"

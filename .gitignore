@@ -14,3 +14,4 @@ gendba_pipeline/output/*/work/
 pipeline/output/**
 !pipeline/output/**/
 !pipeline/output/**/*.jsonl
+benchmarks/job/queries_spj_v1
