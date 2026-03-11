@@ -159,6 +159,9 @@ def export(
     dbms_key: str,
     out_training: Path,
     out_manifest: Path,
+    workload: str = "",
+    query_set: str = "",
+    sql_dir: Path | None = None,
 ) -> None:
     logical = _load_calcite_records(calcite_dir, schema_path)
     physical = _load_physical_records(results_dir)
@@ -177,10 +180,13 @@ def export(
         query_text = phys.get("query_text") if phys else None
         source = phys.get("source", {}) if phys else {}
 
+        sql_file_name = f"{query_stem}.sql"
+        sql_source_path = str(sql_dir / sql_file_name) if sql_dir else None
+
         training_row: dict[str, Any] = {
             "id": next_id,
             "schema": log_rec["schema"],
-            "sql_file_name": f"{query_stem}.sql",
+            "sql_file_name": sql_file_name,
             "sql": query_text,
             "ir_logical_token": log_rec["logical_tokenized_plan"],
             "ir_physical_token": {
@@ -193,20 +199,27 @@ def export(
 
         manifest_row: dict[str, Any] = {
             "id": next_id,
-            "query_key": f"{query_stem}.sql",
-            "schema": log_rec["schema"],
-            "dbms": dbms_key,
-            "state": source.get("state"),
             "logical_source": {
                 "plan_json_path": log_rec.get("plan_json_path"),
                 "plan_text_path": log_rec.get("plan_text_path"),
                 "global_mapping_path": log_rec.get("global_mapping_path"),
             },
-            "physical_source": {
-                "result_csv_path": source.get("result_csv_path"),
-                "title": source.get("title"),
-                "message": source.get("message"),
+            "physical_sources": {
+                dbms_key: {
+                    "dbms": source.get("dbms"),
+                    "message": source.get("message"),
+                    "query_id": sql_file_name,
+                    "result_csv_path": source.get("result_csv_path"),
+                    "state": source.get("state"),
+                    "title": source.get("title"),
+                    "version": source.get("version"),
+                },
             },
+            "query_key": sql_file_name,
+            "query_set": query_set,
+            "schema": log_rec["schema"],
+            "sql_source_path": sql_source_path,
+            "workload": workload,
         }
 
         training_rows.append(training_row)
@@ -234,6 +247,9 @@ def main() -> None:
     parser.add_argument("--dbms",         required=True, help="DBMS key, e.g. postgres@12.5")
     parser.add_argument("--out-training", required=True, help="Output training JSONL path")
     parser.add_argument("--out-manifest", required=True, help="Output manifest JSONL path")
+    parser.add_argument("--workload",     default="",    help="Workload name, e.g. job")
+    parser.add_argument("--query-set",    default="",    help="Query set name, e.g. queries")
+    parser.add_argument("--sql-dir",      default=None,  help="Directory containing .sql source files")
     args = parser.parse_args()
 
     export(
@@ -243,6 +259,9 @@ def main() -> None:
         dbms_key=args.dbms,
         out_training=Path(args.out_training),
         out_manifest=Path(args.out_manifest),
+        workload=args.workload,
+        query_set=args.query_set,
+        sql_dir=Path(args.sql_dir) if args.sql_dir else None,
     )
 
 
