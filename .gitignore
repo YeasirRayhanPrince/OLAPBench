@@ -11,3 +11,6 @@ test/**/*.csv
 SQLStorm/
 benchmarks/gendba_pool/queries*
 gendba_pipeline/output/*/work/
+pipeline/output/**
+!pipeline/output/**/
+!pipeline/output/**/*.jsonl

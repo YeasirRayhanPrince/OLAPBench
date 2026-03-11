@@ -1,0 +1,27 @@
+# User edits these two sections to change workload or database
+
+calcite:
+  plangen_bin: /scratch1/yrayhan/calcite/benchmarks/plangen/build/install/plangen/bin/plangen
+
+benchmark:
+  name: job           # any folder name under benchmarks/
+  # query_dir: queries  # subfolder (queries / queries_exhaustive / etc.)
+
+system:
+  dbms: postgres
+  version: "12.5"
+  host: localhost
+  port: 5432
+  user: yrayhan
+  database: postgres
+  load_mode: preloaded
+  index: foreign
+
+run:
+  repetitions: 1
+  warmup: 0
+  timeout: 300
+  fetch_result: false
+  query_plan:
+    retrieve: true
+    system_representation: true
