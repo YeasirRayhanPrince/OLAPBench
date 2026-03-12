@@ -2,8 +2,7 @@
 # pipeline/run.sh — Unified benchmark training data pipeline
 #
 # USAGE
-#   cd /scratch1/yrayhan/OLAPBench          # must run from repo root
-#   source .venv/bin/activate               # activate the virtualenv first
+#   cd /scratch1/yrayhan/OLAPBench
 #   bash pipeline/run.sh                    # uses pipeline/pipeline.yaml by default
 #   bash pipeline/run.sh /path/to/other.yaml  # override config file
 #
@@ -22,15 +21,25 @@
 #     └── olapbench_results/        — raw benchmark CSVs
 #
 # PREREQUISITES
-#   - Virtualenv activated (source .venv/bin/activate)
+#   - Repo virtualenv available at .venv/
 #   - Calcite plangen binary built at the path set in pipeline.yaml
 #   - Target database running and accessible (host/port/user in pipeline.yaml)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VENV_ACTIVATE="${REPO_ROOT}/.venv/bin/activate"
 
 CONFIG="${1:-${SCRIPT_DIR}/pipeline.yaml}"
+
+if [[ ! -f "${VENV_ACTIVATE}" ]]; then
+    echo "Virtual environment activation script not found: ${VENV_ACTIVATE}" >&2
+    exit 1
+fi
+
+cd "${REPO_ROOT}"
+source "${VENV_ACTIVATE}"
+echo "Activated virtual environment: ${VENV_ACTIVATE}"
 
 # --------------------------------------------------------------------------
 # 1. Parse YAML into shell variables

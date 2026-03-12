@@ -3,7 +3,8 @@ from __future__ import annotations
 import itertools
 import random
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
+from numbers import Real
 from typing import Any
 
 from query_curriculum.core import (
@@ -22,7 +23,16 @@ from query_curriculum.core import (
     TableSchema,
     validate_manifest_entry,
 )
-from query_curriculum.templates import apply_template_packs
+from query_curriculum.templates import apply_template_packs, register_template_pack
+
+
+JOB_LIKE_TEMPLATE_PACK = "job_like_implicit_joins"
+SEED_BUCKET_PRIORITY = ("medium", "high", "low", "very_high", "very_low")
+SEED_FAMILY_PRIORITY = ("range", "membership", "equality", "null")
+MAX_MCV_PREDICATES_PER_COLUMN = 6
+MEMBERSHIP_WIDTHS = (2, 3, 4)
+RANGE_QUANTILES = (0.15, 0.35, 0.50, 0.70, 0.85)
+MAX_RANGE_PREDICATES_PER_COLUMN = 6
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,7 @@ class SpjCandidate:
     target_selectivity_bucket: str
     estimated_selectivity: float | None
     rule_family: str
+    render_mode: str = "ansi"
     template_pack: str | None = None
     calibrated: bool = False
     calibration_source: str = "schema"
@@ -77,6 +88,8 @@ class SpjCandidate:
         return normalize_sql(self.render_sql())
 
     def render_sql(self) -> str:
+        if self.render_mode == "job_like":
+            return render_job_like_sql(self)
         projection_sql = ", ".join(f"{alias}.{column}" for _, alias, column in self.projections) or "*"
         lines = [f"SELECT {projection_sql}", f"FROM {self.base_table} AS {self.aliases()[self.base_table]}"]
         for join in self.joins:
@@ -150,6 +163,21 @@ def render_predicate(predicate: PredicateSpec) -> str:
     return f"{qualified} {predicate.operator} {sql_literal(predicate.value)}"
 
 
+def render_job_like_sql(candidate: SpjCandidate) -> str:
+    aliases = candidate.aliases()
+    projection_sql = ", ".join(f"{alias}.{column}" for _, alias, column in candidate.projections) or "*"
+    from_sql = ", ".join(f"{table_name} AS {aliases[table_name]}" for table_name in candidate.tables)
+    where_parts = [f"{join.left_alias}.{join.left_column} = {join.right_alias}.{join.right_column}" for join in candidate.joins]
+    where_parts.extend(render_predicate(predicate) for join in candidate.joins for predicate in join.on_predicates)
+    where_parts.extend(render_predicate(predicate) for predicate in candidate.predicates if predicate.placement == "where")
+
+    lines = [f"SELECT {projection_sql}", f"FROM {from_sql}"]
+    if where_parts:
+        lines.append("WHERE " + "\n  AND ".join(where_parts))
+    lines.append(";")
+    return "\n".join(lines) + "\n"
+
+
 def stage_key(table_count: int) -> str:
     return f"{table_count}_table"
 
@@ -178,36 +206,190 @@ def build_projection_options(table_specs: list[TableSchema], aliases: dict[str, 
 
 def estimate_from_stats(column: ColumnSchema, stats: ColumnStats | None, family: str) -> float | None:
     if stats is None:
-        if family == "null":
-            return 0.10
-        if family == "range":
-            return 0.15 if column.is_numeric else 0.10
-        if family == "membership":
-            return 0.12
-        if family == "like":
-            return 0.08
-        return 0.05
-    if family == "null" and stats.null_frac is not None:
-        return max(0.001, stats.null_frac)
+        return None
+    if family == "null" and stats.null_frac is not None and 0.0 < stats.null_frac < 1.0:
+        return max(0.001, min(0.999, float(stats.null_frac)))
     if family == "range":
-        return 0.10 if len(stats.histogram_bounds) < 4 else max(0.02, 1.0 / max(4, len(stats.histogram_bounds)))
+        histogram = [bound for bound in stats.histogram_bounds if isinstance(bound, Real)]
+        if len(histogram) >= 4:
+            return max(0.01, 1.0 / max(4, len(histogram) - 1))
     if family == "membership" and stats.most_common_freqs:
-        return max(0.001, min(0.95, sum(stats.most_common_freqs[:2])))
+        return max(0.001, min(0.95, sum(float(value) for value in stats.most_common_freqs[:2])))
     if family == "equality" and stats.most_common_freqs:
         return max(0.001, min(0.95, float(stats.most_common_freqs[0])))
-    if family == "like":
-        return 0.08
-    return 0.05
+    return None
 
 
-def literal_from_stats(column: ColumnSchema, stats: ColumnStats | None) -> Any:
-    if stats and stats.most_common_vals:
-        return stats.most_common_vals[0]
-    if column.is_numeric:
-        return 1
-    if column.is_text:
-        return "A"
-    return 1
+def _clamp_selectivity(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return max(0.0001, min(0.99, float(value)))
+
+
+def _meaningful_null_frac(stats: ColumnStats | None) -> bool:
+    return stats is not None and stats.null_frac is not None and 0.0 < stats.null_frac < 1.0
+
+
+def _spread_sample_indices(count: int, limit: int) -> list[int]:
+    if count <= 0 or limit <= 0:
+        return []
+    if count <= limit:
+        return list(range(count))
+    if limit == 1:
+        return [0]
+    indices: list[int] = []
+    for position in range(limit):
+        index = round(position * (count - 1) / (limit - 1))
+        if index not in indices:
+            indices.append(index)
+    next_index = 0
+    while len(indices) < limit and next_index < count:
+        if next_index not in indices:
+            indices.append(next_index)
+        next_index += 1
+    return sorted(indices)
+
+
+def _sampled_mcv_entries(stats: ColumnStats | None, limit: int = MAX_MCV_PREDICATES_PER_COLUMN) -> list[tuple[Any, float]]:
+    if stats is None:
+        return []
+    entries = [
+        (value, float(freq))
+        for value, freq in zip(stats.most_common_vals, stats.most_common_freqs)
+        if freq is not None
+    ]
+    if not entries:
+        return []
+    return [entries[index] for index in _spread_sample_indices(len(entries), min(limit, len(entries)))]
+
+
+def _membership_windows(entries: list[tuple[Any, float]]) -> list[tuple[list[Any], float]]:
+    groups: list[tuple[list[Any], float]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for width in MEMBERSHIP_WIDTHS:
+        if len(entries) < width:
+            continue
+        candidate_windows = [entries[:width]]
+        if len(entries) > width:
+            candidate_windows.append(entries[-width:])
+        if len(entries) > width + 1:
+            start = max(0, (len(entries) - width) // 2)
+            candidate_windows.append(entries[start : start + width])
+        for window in candidate_windows:
+            values = tuple(value for value, _ in window)
+            if values in seen:
+                continue
+            seen.add(values)
+            groups.append((list(values), _clamp_selectivity(sum(freq for _, freq in window)) or 0.0))
+    return groups
+
+
+def _range_intervals(stats: ColumnStats | None) -> list[tuple[str, Any, float]]:
+    if stats is None:
+        return []
+    histogram = [bound for bound in stats.histogram_bounds if isinstance(bound, Real)]
+    if len(histogram) < 4:
+        return []
+    cut_points: list[tuple[float, Any]] = []
+    for quantile in sorted(set(RANGE_QUANTILES)):
+        index = min(len(histogram) - 2, max(1, int((len(histogram) - 1) * quantile)))
+        value = histogram[index]
+        if cut_points and cut_points[-1][1] == value:
+            continue
+        cut_points.append((quantile, value))
+    if len(cut_points) < 2:
+        return []
+
+    intervals: list[tuple[str, Any, float]] = [("<=", cut_points[0][1], _clamp_selectivity(cut_points[0][0]) or 0.0)]
+    for (left_quantile, left_value), (right_quantile, right_value) in zip(cut_points, cut_points[1:]):
+        if left_value == right_value:
+            continue
+        intervals.append(("between", [left_value, right_value], _clamp_selectivity(max(0.01, right_quantile - left_quantile)) or 0.0))
+    intervals.append((">=", cut_points[-1][1], _clamp_selectivity(max(0.01, 1.0 - cut_points[-1][0])) or 0.0))
+    return intervals[:MAX_RANGE_PREDICATES_PER_COLUMN]
+
+
+def _build_null_predicates(table: TableSchema, alias: str, column: ColumnSchema, stats: ColumnStats | None) -> list[PredicateSpec]:
+    if not column.nullable or not _meaningful_null_frac(stats):
+        return []
+    assert stats is not None and stats.null_frac is not None
+    return [
+        PredicateSpec(
+            table=table.name,
+            alias=alias,
+            column=column.name,
+            operator="is_null",
+            family="null",
+            selectivity=_clamp_selectivity(stats.null_frac),
+        ),
+        PredicateSpec(
+            table=table.name,
+            alias=alias,
+            column=column.name,
+            operator="is_not_null",
+            family="null",
+            selectivity=_clamp_selectivity(1.0 - stats.null_frac),
+        ),
+    ]
+
+
+def _build_mcv_predicates(table: TableSchema, alias: str, column: ColumnSchema, stats: ColumnStats | None) -> list[PredicateSpec]:
+    predicates: list[PredicateSpec] = []
+    sampled_entries = _sampled_mcv_entries(stats)
+    for value, estimate in sampled_entries:
+        predicates.append(
+            PredicateSpec(
+                table=table.name,
+                alias=alias,
+                column=column.name,
+                operator="=",
+                value=value,
+                family="equality",
+                selectivity=_clamp_selectivity(estimate),
+            )
+        )
+    for values, estimate in _membership_windows(sampled_entries):
+        predicates.append(
+            PredicateSpec(
+                table=table.name,
+                alias=alias,
+                column=column.name,
+                operator="in",
+                value=values,
+                family="membership",
+                selectivity=estimate,
+            )
+        )
+    return predicates
+
+
+def _build_range_predicates(table: TableSchema, alias: str, column: ColumnSchema, stats: ColumnStats | None) -> list[PredicateSpec]:
+    if not column.is_numeric:
+        return []
+    predicates: list[PredicateSpec] = []
+    for operator, value, estimate in _range_intervals(stats):
+        predicates.append(
+            PredicateSpec(
+                table=table.name,
+                alias=alias,
+                column=column.name,
+                operator=operator,
+                value=value,
+                family="range",
+                selectivity=estimate,
+            )
+        )
+    return predicates
+
+
+def predicate_selection_score(predicate: PredicateSpec) -> float:
+    if predicate.selectivity is None:
+        return 0.0
+    bucket = bucket_for_selectivity(predicate.selectivity)
+    target = BUCKET_TARGETS[bucket]
+    closeness = max(0.0, 1.0 - abs(predicate.selectivity - target))
+    richness = 0.05 if predicate.family in {"membership", "range"} else 0.0
+    return closeness + richness
 
 
 def build_predicate_seeds(
@@ -218,91 +400,9 @@ def build_predicate_seeds(
     predicates: list[PredicateSpec] = []
     for column in sorted(table.columns.values(), key=lambda item: (item.role, item.name)):
         stats = column_stats.get(column.name)
-        if column.nullable:
-            predicates.append(
-                PredicateSpec(
-                    table=table.name,
-                    alias=alias,
-                    column=column.name,
-                    operator="is_null",
-                    family="null",
-                    selectivity=estimate_from_stats(column, stats, "null"),
-                )
-            )
-        if column.is_numeric:
-            histogram = stats.histogram_bounds if stats else []
-            if len(histogram) >= 4:
-                predicates.append(
-                    PredicateSpec(
-                        table=table.name,
-                        alias=alias,
-                        column=column.name,
-                        operator="between",
-                        value=[histogram[1], histogram[-2]],
-                        family="range",
-                        selectivity=estimate_from_stats(column, stats, "range"),
-                    )
-                )
-            else:
-                predicates.append(
-                    PredicateSpec(
-                        table=table.name,
-                        alias=alias,
-                        column=column.name,
-                        operator="between",
-                        value=[1, 100],
-                        family="range",
-                        selectivity=estimate_from_stats(column, stats, "range"),
-                    )
-                )
-        if stats and stats.most_common_vals:
-            predicates.append(
-                PredicateSpec(
-                    table=table.name,
-                    alias=alias,
-                    column=column.name,
-                    operator="=",
-                    value=stats.most_common_vals[0],
-                    family="equality",
-                    selectivity=estimate_from_stats(column, stats, "equality"),
-                )
-            )
-            if len(stats.most_common_vals) >= 2:
-                predicates.append(
-                    PredicateSpec(
-                        table=table.name,
-                        alias=alias,
-                        column=column.name,
-                        operator="in",
-                        value=stats.most_common_vals[:2],
-                        family="membership",
-                        selectivity=estimate_from_stats(column, stats, "membership"),
-                    )
-                )
-        else:
-            predicates.append(
-                PredicateSpec(
-                    table=table.name,
-                    alias=alias,
-                    column=column.name,
-                    operator="=",
-                    value=literal_from_stats(column, stats),
-                    family="equality" if not column.is_text else "like",
-                    selectivity=estimate_from_stats(column, stats, "equality" if not column.is_text else "like"),
-                )
-            )
-        if column.is_text:
-            predicates.append(
-                PredicateSpec(
-                    table=table.name,
-                    alias=alias,
-                    column=column.name,
-                    operator="like",
-                    value="A%",
-                    family="like",
-                    selectivity=estimate_from_stats(column, stats, "like"),
-                )
-            )
+        predicates.extend(_build_null_predicates(table, alias, column, stats))
+        predicates.extend(_build_mcv_predicates(table, alias, column, stats))
+        predicates.extend(_build_range_predicates(table, alias, column, stats))
     deduped: dict[tuple[str, str, str, str], PredicateSpec] = {}
     for predicate in predicates:
         key = (predicate.column, predicate.operator, repr(predicate.value), predicate.family)
@@ -318,16 +418,56 @@ def top_seed_pool(
     limit: int = 6,
 ) -> list[PredicateSpec]:
     seeds = build_predicate_seeds(table, alias, snapshot.column_stats.get(table.name, {}))
-    family_rank = {"equality": 0, "membership": 1, "range": 2, "null": 3, "like": 4}
-    return sorted(
+    ranked = sorted(
         seeds,
         key=lambda predicate: (
-            family_rank.get(predicate.family, 99),
-            abs((predicate.selectivity or 0.10) - BUCKET_TARGETS["medium"]),
+            -predicate_selection_score(predicate),
             predicate.column,
             predicate.operator,
+            repr(predicate.value),
         ),
-    )[:limit]
+    )
+    groups: dict[tuple[str, str], list[PredicateSpec]] = defaultdict(list)
+    for predicate in ranked:
+        if predicate.selectivity is None:
+            continue
+        groups[(bucket_for_selectivity(predicate.selectivity), predicate.family)].append(predicate)
+
+    ordered_keys = [
+        (bucket, family)
+        for bucket in SEED_BUCKET_PRIORITY
+        for family in SEED_FAMILY_PRIORITY
+        if groups.get((bucket, family))
+    ]
+    selected: list[PredicateSpec] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    while ordered_keys and len(selected) < limit:
+        next_round: list[tuple[str, str]] = []
+        for key in ordered_keys:
+            if len(selected) >= limit:
+                break
+            while groups[key]:
+                candidate = groups[key].pop(0)
+                signature = (candidate.column, candidate.operator, repr(candidate.value), candidate.family)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                selected.append(candidate)
+                break
+            if groups[key]:
+                next_round.append(key)
+        ordered_keys = next_round
+
+    if len(selected) < limit:
+        for predicate in ranked:
+            signature = (predicate.column, predicate.operator, repr(predicate.value), predicate.family)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            selected.append(predicate)
+            if len(selected) >= limit:
+                break
+    return selected[:limit]
 
 
 def unique_predicate_groups(groups: list[list[PredicateSpec]]) -> list[list[PredicateSpec]]:
@@ -405,6 +545,120 @@ def average_selectivity(predicates: list[PredicateSpec]) -> float | None:
     for estimate in estimates:
         value *= estimate
     return max(0.0001, min(0.99, value))
+
+
+def _numeric_literal_from_stats(stats: ColumnStats | None) -> int | float | None:
+    histogram = list(stats.histogram_bounds) if stats else []
+    numeric_bounds = [bound for bound in histogram if isinstance(bound, Real)]
+    if len(numeric_bounds) >= 2:
+        return numeric_bounds[1]
+    if numeric_bounds:
+        return numeric_bounds[0]
+    if stats:
+        for value in stats.most_common_vals:
+            if isinstance(value, Real):
+                return value
+    return None
+
+
+def _job_like_filter_column(
+    table: TableSchema,
+    join_columns: set[str],
+    column_stats: dict[str, ColumnStats],
+) -> ColumnSchema | None:
+    numeric_columns = [
+        column
+        for column in table.columns.values()
+        if column.is_numeric and _numeric_literal_from_stats(column_stats.get(column.name)) is not None
+    ]
+    if not numeric_columns:
+        return None
+
+    def sort_key(column: ColumnSchema) -> tuple[int, int, str]:
+        return (0 if column.is_foreign_key else 1, 0 if column.is_primary_key else 1, column.name)
+
+    non_join = sorted(
+        [column for column in numeric_columns if column.name not in join_columns and not column.is_primary_key],
+        key=sort_key,
+    )
+    if non_join:
+        return non_join[0]
+
+    join_key_columns = sorted(
+        [column for column in numeric_columns if column.name in join_columns or column.is_foreign_key],
+        key=sort_key,
+    )
+    if join_key_columns:
+        return join_key_columns[0]
+
+    primary_keys = sorted([column for column in numeric_columns if column.is_primary_key], key=sort_key)
+    if primary_keys:
+        return primary_keys[0]
+
+    return sorted(numeric_columns, key=sort_key)[0]
+
+
+def build_job_like_predicates(
+    candidate: SpjCandidate,
+    catalog: dict[str, TableSchema],
+    snapshot: StatsSnapshot,
+) -> list[PredicateSpec]:
+    join_columns: dict[str, set[str]] = defaultdict(set)
+    for join in candidate.joins:
+        join_columns[join.left_table].add(join.left_column)
+        join_columns[join.right_table].add(join.right_column)
+
+    aliases = candidate.aliases()
+    predicates: list[PredicateSpec] = []
+    for table_name in candidate.tables:
+        table = catalog[table_name]
+        stats_map = snapshot.column_stats.get(table_name, {})
+        column = _job_like_filter_column(table, join_columns.get(table_name, set()), stats_map)
+        if column is None:
+            return []
+        stats = stats_map.get(column.name)
+        value = _numeric_literal_from_stats(stats)
+        if value is None:
+            return []
+        predicates.append(
+            PredicateSpec(
+                table=table_name,
+                alias=aliases[table_name],
+                column=column.name,
+                operator=">",
+                value=value,
+                family="job_like_range",
+                selectivity=estimate_from_stats(column, stats, "range"),
+            )
+        )
+    return predicates
+
+
+def append_job_like_join_templates(candidates: list[SpjCandidate], context: dict[str, Any]) -> list[SpjCandidate]:
+    catalog: dict[str, TableSchema] = context["catalog"]
+    snapshot: StatsSnapshot = context["snapshot"]
+    appended: list[SpjCandidate] = []
+
+    for candidate in candidates:
+        if candidate.join_type != "inner" or len(candidate.tables) < 2 or candidate.render_mode != "ansi":
+            continue
+        extra_predicates = build_job_like_predicates(candidate, catalog, snapshot)
+        if len(extra_predicates) != len(candidate.tables):
+            continue
+        all_predicates = list(candidate.predicates) + extra_predicates
+        appended.append(
+            replace(
+                candidate,
+                predicates=all_predicates,
+                predicate_families=sorted(set(candidate.predicate_families) | {"job_like_range"}),
+                target_selectivity_bucket=bucket_for_selectivity(average_selectivity(all_predicates)),
+                estimated_selectivity=average_selectivity(all_predicates),
+                rule_family=f"job_like_{candidate.rule_family}",
+                render_mode="job_like",
+                template_pack=JOB_LIKE_TEMPLATE_PACK,
+            )
+        )
+    return list(candidates) + appended
 
 
 def build_stage_one_candidates(
@@ -831,8 +1085,8 @@ def build_multi_table_candidates(
     return unique_candidates_by_signature(candidates)
 
 
-def balanced_select(candidates: list[SpjCandidate], budget: int, seed: int) -> list[SpjCandidate]:
-    if budget <= 0 or not candidates:
+def ordered_candidates(candidates: list[SpjCandidate], seed: int) -> list[SpjCandidate]:
+    if not candidates:
         return []
     rng = random.Random(seed)
     groups: dict[tuple[Any, ...], list[SpjCandidate]] = defaultdict(list)
@@ -850,33 +1104,51 @@ def balanced_select(candidates: list[SpjCandidate], budget: int, seed: int) -> l
     for key in ordered_keys:
         rng.shuffle(groups[key])
     selected: list[SpjCandidate] = []
-    while len(selected) < budget and ordered_keys:
+    while ordered_keys:
         next_round: list[tuple[Any, ...]] = []
         for key in ordered_keys:
             if groups[key]:
                 selected.append(groups[key].pop(0))
-                if len(selected) >= budget:
-                    break
             if groups[key]:
                 next_round.append(key)
         ordered_keys = next_round
     return selected
 
 
-def calibrate_selected(
-    candidates: list[SpjCandidate],
+def calibrate_candidate(
+    candidate: SpjCandidate,
     snapshot: StatsSnapshot,
 ) -> None:
     if snapshot.mode != "stats_plus_selective_probes" or snapshot.provider is None:
         return
-    for candidate in candidates:
-        row_count = snapshot.provider.probe_count(candidate.render_sql())
-        base_table_count = snapshot.table_counts.get(candidate.base_table, 0)
-        candidate.observed_rows = row_count
-        candidate.observed_selectivity = None if base_table_count == 0 else row_count / base_table_count
-        candidate.target_selectivity_bucket = bucket_for_selectivity(candidate.observed_selectivity)
-        candidate.calibrated = True
-        candidate.calibration_source = "probe"
+    row_count = snapshot.provider.probe_count(candidate.render_sql())
+    base_table_count = snapshot.table_counts.get(candidate.base_table, 0)
+    candidate.observed_rows = row_count
+    candidate.observed_selectivity = None if base_table_count == 0 else row_count / base_table_count
+    candidate.target_selectivity_bucket = bucket_for_selectivity(candidate.observed_selectivity)
+    candidate.calibrated = True
+    candidate.calibration_source = "probe"
+
+
+def select_candidates_for_stage(
+    candidates: list[SpjCandidate],
+    budget: int,
+    seed: int,
+    snapshot: StatsSnapshot,
+) -> list[SpjCandidate]:
+    ordered = ordered_candidates(candidates, seed)
+    if snapshot.mode != "stats_plus_selective_probes" or snapshot.provider is None:
+        return ordered[:budget]
+
+    selected: list[SpjCandidate] = []
+    for candidate in ordered:
+        calibrate_candidate(candidate, snapshot)
+        if candidate.observed_rows == 0:
+            continue
+        selected.append(candidate)
+        if len(selected) >= budget:
+            break
+    return selected
 
 
 def emit_artifacts(
@@ -936,11 +1208,19 @@ def generate_spj_workload(
         available = stage_candidates.get(current_stage, [])
         if budget > len(available):
             raise ValueError(
-                f"Stage {current_stage} requested {budget} queries but only {len(available)} unique candidates were generated"
+                f"Stage {current_stage} requested {budget} queries but only {len(available)} unique candidates were generated "
+                f"from stats-backed predicates (literal fallbacks are disabled)"
             )
-        chosen = balanced_select(available, budget, config.seed + table_count)
+        chosen = select_candidates_for_stage(available, budget, config.seed + table_count, snapshot)
+        if budget > len(chosen):
+            raise ValueError(
+                f"Stage {current_stage} requested {budget} non-empty queries but only {len(chosen)} remained after "
+                f"zero-row filtering and stats-backed predicate selection"
+            )
         selected.extend(chosen)
 
-    calibrate_selected(selected, snapshot)
     selected = sorted(unique_candidates_by_signature(selected), key=lambda item: (item.stage_id, item.join_topology, item.join_type, item.signature()))
     return emit_artifacts(selected, catalog, join_edges, config.benchmark, schema_path, config.suffix, config.seed)
+
+
+register_template_pack(JOB_LIKE_TEMPLATE_PACK, append_job_like_join_templates)
