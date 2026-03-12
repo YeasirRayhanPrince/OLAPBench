@@ -136,6 +136,7 @@ class GeneratorConfig:
     join_types: tuple[str, ...] = ("inner", "left")
     stage_budgets: dict[str, int] = field(default_factory=default_stage_budgets)
     max_predicates_per_table: int = 3
+    probe_workers: int = 4
     stats_mode: str = "auto"
     pg: PgConnectionConfig | None = None
     template_packs: tuple[str, ...] = ()
@@ -363,6 +364,9 @@ class PostgresStatsProvider:
             self._handle.close()
             self._handle = None
 
+    def clone(self) -> "PostgresStatsProvider":
+        return PostgresStatsProvider(self.connection)
+
     def query_rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
         handle = self._connect()
         with handle.cursor() as cursor:
@@ -431,10 +435,13 @@ def load_stats_snapshot(config: GeneratorConfig, catalog: dict[str, TableSchema]
             column_stats=provider.load_column_stats(table_names),
             provider=provider,
         )
-    except Exception:
+    except Exception as exc:
         provider.close()
-        if mode == "stats_only":
-            raise
+        if mode in {"stats_only", "stats_plus_selective_probes"}:
+            raise RuntimeError(
+                f"Failed to load PostgreSQL stats for {mode}; SPJ predicate generation now requires real stats "
+                "when PostgreSQL-backed generation is enabled"
+            ) from exc
         return StatsSnapshot(mode="schema_only")
 
 
