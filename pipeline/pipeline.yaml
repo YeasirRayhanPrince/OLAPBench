@@ -5,7 +5,7 @@ calcite:
 
 benchmark:
   name: job           # any folder name under benchmarks/
-  # query_dir: queries  # subfolder (queries / queries_exhaustive / etc.)
+  query_dir: spj_v2  # subfolder (queries / queries_exhaustive / etc.)
 
 system:
   dbms: postgres

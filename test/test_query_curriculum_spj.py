@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from query_curriculum.templates import apply_template_packs
 from query_curriculum.core import (
     ColumnStats,
     GeneratorConfig,
@@ -15,7 +16,14 @@ from query_curriculum.core import (
     load_stats_snapshot,
     load_schema_catalog,
 )
-from query_curriculum.spj import generate_spj_workload
+from query_curriculum.spj import (
+    JOB_LIKE_TEMPLATE_PACK,
+    build_predicate_seeds,
+    build_multi_table_candidates,
+    build_pair_candidates_for_edge,
+    generate_spj_workload,
+    top_seed_pool,
+)
 
 
 TOY_SCHEMA = {
@@ -63,6 +71,39 @@ TOY_SCHEMA = {
     ]
 }
 
+STAR_SCHEMA = {
+    "tables": [
+        {
+            "name": "customers",
+            "columns": [
+                {"name": "id", "type": "integer not null"},
+                {"name": "segment_id", "type": "integer"},
+            ],
+            "primary key": {"column": "id"},
+        },
+        {
+            "name": "orders",
+            "columns": [
+                {"name": "id", "type": "integer not null"},
+                {"name": "customer_id", "type": "integer not null"},
+                {"name": "total_price", "type": "numeric"},
+            ],
+            "primary key": {"column": "id"},
+            "foreign keys": [{"column": "customer_id", "foreign table": "customers", "foreign column": "id"}],
+        },
+        {
+            "name": "payments",
+            "columns": [
+                {"name": "id", "type": "integer not null"},
+                {"name": "customer_id", "type": "integer not null"},
+                {"name": "amount", "type": "numeric"},
+            ],
+            "primary key": {"column": "id"},
+            "foreign keys": [{"column": "customer_id", "foreign table": "customers", "foreign column": "id"}],
+        },
+    ]
+}
+
 
 class FakeStatsProvider:
     def __init__(self) -> None:
@@ -70,6 +111,21 @@ class FakeStatsProvider:
 
     def probe_count(self, sql: str) -> int:
         self.probe_calls += 1
+        return 10
+
+    def close(self) -> None:
+        return None
+
+
+class FakeSkippingStatsProvider:
+    def __init__(self, zero_calls: int) -> None:
+        self.zero_calls = zero_calls
+        self.probe_calls = 0
+
+    def probe_count(self, sql: str) -> int:
+        self.probe_calls += 1
+        if self.probe_calls <= self.zero_calls:
+            return 0
         return 10
 
     def close(self) -> None:
@@ -86,6 +142,81 @@ class QueryCurriculumSpjTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def _pair_candidates(self, snapshot: StatsSnapshot, config: GeneratorConfig) -> list:
+        return [candidate for edge in self.join_edges for candidate in build_pair_candidates_for_edge(edge, self.catalog, snapshot, config)]
+
+    def _template_context(self, snapshot: StatsSnapshot, config: GeneratorConfig, catalog=None, join_edges=None) -> dict:
+        return {
+            "catalog": catalog or self.catalog,
+            "join_edges": join_edges or self.join_edges,
+            "config": config,
+            "snapshot": snapshot,
+        }
+
+    def _job_like_variant(self, baseline_candidate, candidates: list):
+        for candidate in candidates:
+            if candidate.template_pack != JOB_LIKE_TEMPLATE_PACK:
+                continue
+            if candidate.rule_family != f"job_like_{baseline_candidate.rule_family}":
+                continue
+            if candidate.join_type != baseline_candidate.join_type or candidate.join_topology != baseline_candidate.join_topology:
+                continue
+            if candidate.projection_width != baseline_candidate.projection_width:
+                continue
+            if candidate.projections != baseline_candidate.projections:
+                continue
+            if candidate.joins != baseline_candidate.joins:
+                continue
+            if candidate.predicates[: len(baseline_candidate.predicates)] != baseline_candidate.predicates:
+                continue
+            return candidate
+        raise AssertionError("Matching JOB-like variant not found")
+
+    def _rich_snapshot(self) -> StatsSnapshot:
+        return StatsSnapshot(
+            mode="stats_only",
+            table_counts={"customers": 500, "orders": 2000, "lineitem": 8000, "part": 400},
+            column_stats={
+                "customers": {
+                    "id": ColumnStats(histogram_bounds=[1, 50, 100, 200, 350, 500]),
+                    "segment": ColumnStats(
+                        most_common_vals=["AUTO", "BUILD", "HOME", "TECH", "TOYS", "GARDEN"],
+                        most_common_freqs=[0.28, 0.19, 0.13, 0.09, 0.06, 0.04],
+                    ),
+                    "region": ColumnStats(
+                        null_frac=0.18,
+                        most_common_vals=["N", "S", "E", "W", "C"],
+                        most_common_freqs=[0.22, 0.18, 0.14, 0.09, 0.05],
+                    ),
+                },
+                "orders": {
+                    "customer_id": ColumnStats(histogram_bounds=[1, 50, 200, 700, 1400, 2000], n_distinct=2000),
+                    "total_price": ColumnStats(histogram_bounds=[5, 25, 75, 150, 300, 600, 1200]),
+                    "order_status": ColumnStats(
+                        most_common_vals=["F", "O", "P", "R", "S", "X"],
+                        most_common_freqs=[0.31, 0.22, 0.14, 0.09, 0.05, 0.03],
+                    ),
+                },
+                "lineitem": {
+                    "order_id": ColumnStats(histogram_bounds=[1, 100, 500, 1500, 4000, 8000], n_distinct=8000),
+                    "part_id": ColumnStats(histogram_bounds=[1, 40, 100, 300, 1000, 3000], n_distinct=3000),
+                    "quantity": ColumnStats(
+                        histogram_bounds=[1, 2, 5, 10, 20, 40, 80],
+                        most_common_vals=[1, 2, 5, 10, 20],
+                        most_common_freqs=[0.16, 0.12, 0.09, 0.06, 0.04],
+                    ),
+                },
+                "part": {
+                    "category": ColumnStats(
+                        null_frac=0.05,
+                        most_common_vals=["A", "B", "C", "D", "E", "F"],
+                        most_common_freqs=[0.24, 0.18, 0.13, 0.08, 0.05, 0.03],
+                    ),
+                    "retail_price": ColumnStats(histogram_bounds=[10, 20, 40, 80, 160, 320, 640]),
+                },
+            },
+        )
 
     def test_balanced_generation_and_reproducibility(self) -> None:
         config = GeneratorConfig(
@@ -150,6 +281,235 @@ class QueryCurriculumSpjTest(unittest.TestCase):
         with mock.patch("query_curriculum.core.psycopg2", None):
             with self.assertRaisesRegex(RuntimeError, "psycopg2 is required"):
                 load_stats_snapshot(config, self.catalog)
+
+    def test_probe_mode_skips_zero_row_queries(self) -> None:
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="probe",
+            max_join_tables=1,
+            stage_budgets={"1_table": 2},
+            seed=3,
+            stats_mode="stats_plus_selective_probes",
+        )
+        provider = FakeSkippingStatsProvider(zero_calls=2)
+        snapshot = StatsSnapshot(
+            mode="stats_plus_selective_probes",
+            table_counts={"customers": 100, "orders": 100, "lineitem": 100, "part": 100},
+            provider=provider,
+        )
+        manifest, artifacts = generate_spj_workload(self.catalog, self.join_edges, config, str(self.schema_path), snapshot)
+
+        self.assertEqual(len(artifacts), 2)
+        self.assertGreater(provider.probe_calls, len(artifacts))
+        for query in manifest["queries"]:
+            self.assertTrue(query["calibrated"])
+            self.assertGreater(query["observed_rows"], 0)
+
+    def test_no_fallback_predicates_without_stats(self) -> None:
+        seeds = build_predicate_seeds(self.catalog["customers"], "c", {})
+
+        self.assertEqual(seeds, [])
+
+    def test_stats_backed_predicates_are_diverse_without_like_fallbacks(self) -> None:
+        snapshot = self._rich_snapshot()
+        seeds = build_predicate_seeds(self.catalog["customers"], "c", snapshot.column_stats["customers"])
+        segment_predicates = [predicate for predicate in seeds if predicate.column == "segment"]
+        region_predicates = [predicate for predicate in seeds if predicate.column == "region"]
+
+        self.assertGreaterEqual(len([predicate for predicate in segment_predicates if predicate.operator == "="]), 4)
+        self.assertGreaterEqual(len([predicate for predicate in segment_predicates if predicate.operator == "in"]), 2)
+        self.assertFalse(any(predicate.operator == "like" for predicate in seeds))
+        self.assertEqual(sorted(predicate.operator for predicate in region_predicates if predicate.family == "null"), ["is_not_null", "is_null"])
+
+    def test_histogram_ranges_replace_fk_equality_without_mcv(self) -> None:
+        snapshot = self._rich_snapshot()
+        seeds = build_predicate_seeds(self.catalog["orders"], "o", snapshot.column_stats["orders"])
+        customer_id_predicates = [predicate for predicate in seeds if predicate.column == "customer_id"]
+        total_price_predicates = [predicate for predicate in seeds if predicate.column == "total_price"]
+
+        self.assertFalse(any(predicate.operator == "=" for predicate in customer_id_predicates))
+        self.assertGreaterEqual(len(total_price_predicates), 3)
+        self.assertTrue(any(predicate.operator == "<=" for predicate in total_price_predicates))
+        self.assertTrue(any(predicate.operator == ">=" for predicate in total_price_predicates))
+        self.assertTrue(any(predicate.operator == "between" for predicate in total_price_predicates))
+
+    def test_top_seed_pool_prefers_bucket_and_family_diversity(self) -> None:
+        snapshot = self._rich_snapshot()
+        pool = top_seed_pool(self.catalog["orders"], "o", snapshot, limit=6)
+
+        self.assertGreaterEqual(len({predicate.family for predicate in pool}), 2)
+        self.assertIn("range", {predicate.family for predicate in pool})
+        self.assertFalse(any(predicate.operator == "like" for predicate in pool))
+        self.assertGreaterEqual(len({predicate.column for predicate in pool}), 2)
+
+    def test_schema_only_generation_fails_when_budget_exceeds_no_fallback_pool(self) -> None:
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="schema_only_fail",
+            max_join_tables=1,
+            stage_budgets={"1_table": 17},
+        )
+
+        with self.assertRaisesRegex(ValueError, "literal fallbacks are disabled"):
+            generate_spj_workload(self.catalog, self.join_edges, config, str(self.schema_path), StatsSnapshot(mode="schema_only"))
+
+    def test_job_like_template_pack_appends_candidates_and_preserves_left_joins(self) -> None:
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="joblike",
+            max_join_tables=2,
+            join_types=("inner", "left"),
+        )
+        snapshot = self._rich_snapshot()
+        baseline_pairs = self._pair_candidates(snapshot, config)
+        enriched_pairs = apply_template_packs(
+            [JOB_LIKE_TEMPLATE_PACK],
+            baseline_pairs,
+            self._template_context(snapshot, config),
+        )
+
+        self.assertGreater(len(enriched_pairs), len(baseline_pairs))
+        self.assertEqual(
+            len([candidate for candidate in enriched_pairs if candidate.join_type == "left"]),
+            len([candidate for candidate in baseline_pairs if candidate.join_type == "left"]),
+        )
+        self.assertTrue(any(candidate.template_pack == JOB_LIKE_TEMPLATE_PACK for candidate in enriched_pairs))
+        self.assertTrue(all(candidate.template_pack is None for candidate in baseline_pairs))
+        self.assertTrue(
+            all(candidate.template_pack is None for candidate in enriched_pairs if candidate.join_type == "left")
+        )
+
+    def test_job_like_pair_sql_uses_implicit_join_and_reuses_projection(self) -> None:
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="joblike",
+            max_join_tables=2,
+            join_types=("inner",),
+        )
+        snapshot = self._rich_snapshot()
+        baseline_pairs = self._pair_candidates(snapshot, config)
+        enriched_pairs = apply_template_packs(
+            [JOB_LIKE_TEMPLATE_PACK],
+            baseline_pairs,
+            self._template_context(snapshot, config),
+        )
+        baseline_candidate = next(
+            candidate
+            for candidate in baseline_pairs
+            if candidate.join_type == "inner" and candidate.projection_width == "medium" and len(candidate.predicates) >= 1
+        )
+        job_like_candidate = self._job_like_variant(baseline_candidate, enriched_pairs)
+        sql = job_like_candidate.render_sql()
+
+        self.assertEqual(job_like_candidate.projections, baseline_candidate.projections)
+        self.assertIn(", ", sql.splitlines()[1])
+        self.assertNotIn("JOIN", sql)
+        self.assertIn("WHERE ", sql)
+        self.assertIn(
+            f"{baseline_candidate.joins[0].left_alias}.{baseline_candidate.joins[0].left_column} = "
+            f"{baseline_candidate.joins[0].right_alias}.{baseline_candidate.joins[0].right_column}",
+            sql,
+        )
+        self.assertGreaterEqual(sql.count(" > "), len(job_like_candidate.tables))
+
+    def test_job_like_chain_sql_uses_where_join_predicates(self) -> None:
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="joblike",
+            max_join_tables=3,
+            join_types=("inner",),
+        )
+        snapshot = self._rich_snapshot()
+        baseline_multi = [candidate for candidate in build_multi_table_candidates(self.join_edges, self.catalog, snapshot, config) if candidate.join_topology == "chain"]
+        enriched_multi = apply_template_packs(
+            [JOB_LIKE_TEMPLATE_PACK],
+            baseline_multi,
+            self._template_context(snapshot, config),
+        )
+        baseline_candidate = next(candidate for candidate in baseline_multi if candidate.projection_width == "wide" and len(candidate.predicates) >= 1)
+        job_like_candidate = self._job_like_variant(baseline_candidate, enriched_multi)
+        sql = job_like_candidate.render_sql()
+
+        self.assertEqual(job_like_candidate.projections, baseline_candidate.projections)
+        self.assertIn(", ", sql.splitlines()[1])
+        self.assertNotIn("JOIN", sql)
+        self.assertGreaterEqual(sql.count(" = "), len(job_like_candidate.joins))
+        self.assertGreaterEqual(sql.count(" > "), len(job_like_candidate.tables))
+
+    def test_job_like_star_sql_uses_where_join_predicates(self) -> None:
+        star_path = Path(self.temp_dir.name) / "star.dbschema.json"
+        star_path.write_text(json.dumps(STAR_SCHEMA))
+        star_catalog = load_schema_catalog(star_path)
+        star_join_edges = build_join_edges(star_catalog)
+        config = GeneratorConfig(
+            benchmark="star",
+            suffix="joblike",
+            max_join_tables=3,
+            join_types=("inner",),
+        )
+        snapshot = StatsSnapshot(
+            mode="stats_only",
+            table_counts={"customers": 200, "orders": 1200, "payments": 1200},
+            column_stats={
+                "customers": {"id": ColumnStats(histogram_bounds=[1, 10, 30, 70, 120, 200])},
+                "orders": {
+                    "customer_id": ColumnStats(histogram_bounds=[1, 25, 100, 400, 800, 1200]),
+                    "total_price": ColumnStats(histogram_bounds=[5, 20, 60, 120, 240, 480]),
+                },
+                "payments": {
+                    "customer_id": ColumnStats(histogram_bounds=[1, 25, 100, 400, 800, 1200]),
+                    "amount": ColumnStats(histogram_bounds=[1, 10, 25, 50, 100, 250]),
+                },
+            },
+        )
+        baseline_multi = [candidate for candidate in build_multi_table_candidates(star_join_edges, star_catalog, snapshot, config) if candidate.join_topology == "star"]
+        enriched_multi = apply_template_packs(
+            [JOB_LIKE_TEMPLATE_PACK],
+            baseline_multi,
+            self._template_context(snapshot, config, star_catalog, star_join_edges),
+        )
+        baseline_candidate = next(candidate for candidate in baseline_multi if candidate.projection_width == "medium")
+        job_like_candidate = self._job_like_variant(baseline_candidate, enriched_multi)
+        sql = job_like_candidate.render_sql()
+
+        self.assertEqual(job_like_candidate.projections, baseline_candidate.projections)
+        self.assertIn(", ", sql.splitlines()[1])
+        self.assertNotIn("JOIN", sql)
+        self.assertGreaterEqual(sql.count(" = "), len(job_like_candidate.joins))
+        self.assertGreaterEqual(sql.count(" > "), len(job_like_candidate.tables))
+
+    def test_job_like_generation_is_reproducible_and_marks_manifest(self) -> None:
+        base_config = GeneratorConfig(
+            benchmark="toy",
+            suffix="joblike",
+            max_join_tables=2,
+            join_types=("inner",),
+            template_packs=(JOB_LIKE_TEMPLATE_PACK,),
+        )
+        snapshot = self._rich_snapshot()
+        available_pairs = apply_template_packs(
+            [JOB_LIKE_TEMPLATE_PACK],
+            self._pair_candidates(snapshot, base_config),
+            self._template_context(snapshot, base_config),
+        )
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="joblike",
+            max_join_tables=2,
+            join_types=("inner",),
+            template_packs=(JOB_LIKE_TEMPLATE_PACK,),
+            stage_budgets={"1_table": 0, "2_table": len(available_pairs)},
+        )
+
+        manifest_a, artifacts_a = generate_spj_workload(self.catalog, self.join_edges, config, str(self.schema_path), snapshot)
+        manifest_b, artifacts_b = generate_spj_workload(self.catalog, self.join_edges, config, str(self.schema_path), snapshot)
+
+        self.assertEqual([artifact.sql for artifact in artifacts_a], [artifact.sql for artifact in artifacts_b])
+        self.assertTrue(any(query["template_pack"] == JOB_LIKE_TEMPLATE_PACK for query in manifest_a["queries"]))
+        self.assertTrue(any(query["template_pack"] is None for query in manifest_a["queries"]))
+        self.assertTrue(
+            all(query["rule_family"].startswith("job_like_") for query in manifest_a["queries"] if query["template_pack"] == JOB_LIKE_TEMPLATE_PACK)
+        )
 
 
 if __name__ == "__main__":
