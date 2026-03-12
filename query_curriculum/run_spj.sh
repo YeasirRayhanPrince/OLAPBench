@@ -19,21 +19,23 @@ SUFFIX="spj_v2"
 SEED="0"
 MAX_JOIN_TABLES="12"
 MAX_PREDICATES_PER_TABLE="5"
+PROBE_WORKERS="32"
 JOIN_TYPES=("inner" "left")
 TEMPLATE_PACKS=("job_like_implicit_joins")
-STAGE_1_QUERIES="1000"
-STAGE_2_QUERIES="1000"
-STAGE_3_QUERIES="1000"
-STAGE_4_QUERIES="5000"
+STATS_MODE="stats_plus_selective_probes"
+STAGE_1_QUERIES="50"
+STAGE_2_QUERIES="50"
+STAGE_3_QUERIES="100"
+STAGE_4_QUERIES="200"
 
 # Local PostgreSQL connection settings. Change these directly in the file.
 PGHOST_VALUE="127.0.0.1"
 PGPORT_VALUE="5432"
-PGUSER_VALUE="postgres"
+PGUSER_VALUE="yrayhan"
 PGPASSWORD_VALUE=""
 PGDATABASE_VALUE="postgres"
 
-CMD=(python -m query_curriculum.cli generate --benchmark "${BENCHMARK}" --suffix "${SUFFIX}" --replace-output --seed "${SEED}" --max-join-tables "${MAX_JOIN_TABLES}" --max-predicates-per-table "${MAX_PREDICATES_PER_TABLE}" --join-types "${JOIN_TYPES[@]}" --stage-budget "1_table=${STAGE_1_QUERIES}" --stage-budget "2_table=${STAGE_2_QUERIES}" --stage-budget "3_table=${STAGE_3_QUERIES}" --stage-budget "4_table=${STAGE_4_QUERIES}" --pg-enabled --pg-host "${PGHOST_VALUE}" --pg-port "${PGPORT_VALUE}" --pg-user "${PGUSER_VALUE}" --pg-password "${PGPASSWORD_VALUE}" --pg-database "${PGDATABASE_VALUE}")
+CMD=(python -m query_curriculum.cli generate --benchmark "${BENCHMARK}" --suffix "${SUFFIX}" --replace-output --seed "${SEED}" --max-join-tables "${MAX_JOIN_TABLES}" --max-predicates-per-table "${MAX_PREDICATES_PER_TABLE}" --probe-workers "${PROBE_WORKERS}" --join-types "${JOIN_TYPES[@]}" --stage-budget "1_table=${STAGE_1_QUERIES}" --stage-budget "2_table=${STAGE_2_QUERIES}" --stage-budget "3_table=${STAGE_3_QUERIES}" --stage-budget "4_table=${STAGE_4_QUERIES}" --stats-mode "${STATS_MODE}" --pg-enabled --pg-host "${PGHOST_VALUE}" --pg-port "${PGPORT_VALUE}" --pg-user "${PGUSER_VALUE}" --pg-password "${PGPASSWORD_VALUE}" --pg-database "${PGDATABASE_VALUE}")
 
 for template_pack in "${TEMPLATE_PACKS[@]}"; do
     CMD+=(--template-pack "${template_pack}")

@@ -19,9 +19,15 @@ from query_curriculum.core import (
 from query_curriculum.spj import (
     JOB_LIKE_TEMPLATE_PACK,
     build_predicate_seeds,
+    build_projection_templates,
+    bind_projection_templates,
+    bind_seed_template,
+    build_seed_templates,
     build_multi_table_candidates,
     build_pair_candidates_for_edge,
     generate_spj_workload,
+    make_build_context,
+    retain_diverse_candidates,
     top_seed_pool,
 )
 
@@ -113,6 +119,9 @@ class FakeStatsProvider:
         self.probe_calls += 1
         return 10
 
+    def clone(self):
+        return FakeStatsProvider()
+
     def close(self) -> None:
         return None
 
@@ -128,12 +137,34 @@ class FakeSkippingStatsProvider:
             return 0
         return 10
 
+    def clone(self):
+        return FakeSkippingStatsProvider(self.zero_calls)
+
+    def close(self) -> None:
+        return None
+
+
+class CountingProbeProvider:
+    instances: list["CountingProbeProvider"] = []
+
+    def __init__(self) -> None:
+        self.probe_calls = 0
+        CountingProbeProvider.instances.append(self)
+
+    def probe_count(self, sql: str) -> int:
+        self.probe_calls += 1
+        return 10
+
+    def clone(self):
+        return CountingProbeProvider()
+
     def close(self) -> None:
         return None
 
 
 class QueryCurriculumSpjTest(unittest.TestCase):
     def setUp(self) -> None:
+        CountingProbeProvider.instances = []
         self.temp_dir = tempfile.TemporaryDirectory()
         self.schema_path = Path(self.temp_dir.name) / "toy.dbschema.json"
         self.schema_path.write_text(json.dumps(TOY_SCHEMA))
@@ -252,6 +283,7 @@ class QueryCurriculumSpjTest(unittest.TestCase):
             max_join_tables=2,
             stage_budgets={"1_table": 3, "2_table": 3},
             seed=11,
+            probe_workers=1,
             stats_mode="stats_plus_selective_probes",
         )
         provider = FakeStatsProvider()
@@ -289,6 +321,7 @@ class QueryCurriculumSpjTest(unittest.TestCase):
             max_join_tables=1,
             stage_budgets={"1_table": 2},
             seed=3,
+            probe_workers=1,
             stats_mode="stats_plus_selective_probes",
         )
         provider = FakeSkippingStatsProvider(zero_calls=2)
@@ -342,6 +375,39 @@ class QueryCurriculumSpjTest(unittest.TestCase):
         self.assertFalse(any(predicate.operator == "like" for predicate in pool))
         self.assertGreaterEqual(len({predicate.column for predicate in pool}), 2)
 
+    def test_cached_seed_binding_matches_direct_generation(self) -> None:
+        snapshot = self._rich_snapshot()
+        build_context = make_build_context(self.catalog, snapshot, GeneratorConfig(benchmark="toy", suffix="cache"))
+        table = self.catalog["orders"]
+
+        direct = build_predicate_seeds(table, "o", snapshot.column_stats["orders"])
+        cached_templates = build_context.seed_templates_by_table.setdefault(
+            "orders",
+            build_seed_templates(table, snapshot.column_stats["orders"]),
+        )
+        rebound = [bind_seed_template(seed, "o") for seed in cached_templates]
+
+        self.assertEqual(
+            [(predicate.column, predicate.operator, predicate.value, predicate.family) for predicate in direct],
+            [(predicate.column, predicate.operator, predicate.value, predicate.family) for predicate in rebound],
+        )
+
+    def test_cached_projection_binding_matches_direct_generation(self) -> None:
+        aliases = {"customers": "c", "orders": "o"}
+        direct = [
+            (width, [(table, alias, column) for table, alias, column in columns])
+            for width, columns in bind_projection_templates(
+                build_projection_templates([self.catalog["customers"], self.catalog["orders"]]),
+                aliases,
+            )
+        ]
+        rebound = build_projection_templates([self.catalog["customers"], self.catalog["orders"]])
+
+        self.assertEqual(
+            direct,
+            bind_projection_templates(rebound, aliases),
+        )
+
     def test_schema_only_generation_fails_when_budget_exceeds_no_fallback_pool(self) -> None:
         config = GeneratorConfig(
             benchmark="toy",
@@ -352,6 +418,57 @@ class QueryCurriculumSpjTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "literal fallbacks are disabled"):
             generate_spj_workload(self.catalog, self.join_edges, config, str(self.schema_path), StatsSnapshot(mode="schema_only"))
+
+    def test_structural_dedup_preserves_sql_uniqueness(self) -> None:
+        snapshot = self._rich_snapshot()
+        config = GeneratorConfig(benchmark="toy", suffix="dedup", max_join_tables=2)
+
+        candidates = self._pair_candidates(snapshot, config)
+        sql_texts = {candidate.render_sql() for candidate in candidates}
+        structural_signatures = {candidate.signature() for candidate in candidates}
+
+        self.assertEqual(len(sql_texts), len(structural_signatures))
+
+    def test_retain_diverse_candidates_is_deterministic(self) -> None:
+        snapshot = self._rich_snapshot()
+        config = GeneratorConfig(benchmark="toy", suffix="retain", max_join_tables=2)
+        candidates = self._pair_candidates(snapshot, config)
+
+        retained_a = retain_diverse_candidates(candidates, limit=10, seed=17)
+        retained_b = retain_diverse_candidates(candidates, limit=10, seed=17)
+
+        self.assertEqual([candidate.signature() for candidate in retained_a], [candidate.signature() for candidate in retained_b])
+        self.assertGreaterEqual(len({candidate.projection_width for candidate in retained_a}), 2)
+        self.assertGreaterEqual(len({candidate.target_selectivity_bucket for candidate in retained_a}), 2)
+
+    def test_parallel_probing_uses_cloned_providers_and_records_diagnostics(self) -> None:
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="parallel_probe",
+            max_join_tables=2,
+            stage_budgets={"1_table": 3, "2_table": 3},
+            seed=19,
+            probe_workers=3,
+            stats_mode="stats_plus_selective_probes",
+        )
+        provider = CountingProbeProvider()
+        snapshot = StatsSnapshot(
+            mode="stats_plus_selective_probes",
+            table_counts={"customers": 100, "orders": 100, "lineitem": 100, "part": 100},
+            column_stats={
+                "customers": {"segment": ColumnStats(most_common_vals=["AUTO"], most_common_freqs=[0.2])},
+                "orders": {"order_status": ColumnStats(most_common_vals=["F"], most_common_freqs=[0.3])},
+            },
+            provider=provider,
+        )
+
+        manifest, artifacts = generate_spj_workload(self.catalog, self.join_edges, config, str(self.schema_path), snapshot)
+
+        self.assertEqual(len(artifacts), 6)
+        self.assertGreater(len(CountingProbeProvider.instances), 1)
+        diagnostics = manifest["generation_diagnostics"]
+        self.assertGreater(diagnostics["1_table"]["probe_calls"], 0)
+        self.assertGreater(diagnostics["2_table"]["probe_calls"], 0)
 
     def test_job_like_template_pack_appends_candidates_and_preserves_left_joins(self) -> None:
         config = GeneratorConfig(

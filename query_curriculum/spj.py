@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import itertools
 import random
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from math import ceil
 from numbers import Real
 from typing import Any
 
@@ -33,6 +36,32 @@ MAX_MCV_PREDICATES_PER_COLUMN = 6
 MEMBERSHIP_WIDTHS = (2, 3, 4)
 RANGE_QUANTILES = (0.15, 0.35, 0.50, 0.70, 0.85)
 MAX_RANGE_PREDICATES_PER_COLUMN = 6
+MIN_TOPOLOGY_RETAIN = 8
+PROBE_BATCH_MULTIPLIER = 2
+
+
+@dataclass(frozen=True)
+class SeedTemplate:
+    table: str
+    column: str
+    operator: str
+    value: Any = None
+    family: str = "generic"
+    selectivity: float | None = None
+    placement: str = "where"
+
+
+@dataclass
+class SpjBuildContext:
+    catalog: dict[str, TableSchema]
+    snapshot: StatsSnapshot
+    config: GeneratorConfig
+    seed_templates_by_table: dict[str, list[SeedTemplate]]
+    top_seed_templates_by_table_limit: dict[tuple[str, int], list[SeedTemplate]]
+    projection_templates_by_tables: dict[tuple[str, ...], list[tuple[str, list[tuple[str, str]]]]]
+    paths_by_length: dict[int, list[list[JoinEdge]]]
+    stars_by_size: dict[int, list[list[JoinEdge]]]
+    diagnostics: dict[str, dict[str, int]]
 
 
 @dataclass(frozen=True)
@@ -45,6 +74,19 @@ class PredicateSpec:
     family: str = "generic"
     selectivity: float | None = None
     placement: str = "where"
+
+
+def bind_seed_template(seed: SeedTemplate, alias: str) -> PredicateSpec:
+    return PredicateSpec(
+        table=seed.table,
+        alias=alias,
+        column=seed.column,
+        operator=seed.operator,
+        value=seed.value,
+        family=seed.family,
+        selectivity=seed.selectivity,
+        placement=seed.placement,
+    )
 
 
 @dataclass(frozen=True)
@@ -84,8 +126,59 @@ class SpjCandidate:
     filename: str | None = None
     query_id: str | None = None
 
+    def structural_signature(self) -> tuple[Any, ...]:
+        return (
+            self.stage_id,
+            tuple(self.tables),
+            self.base_table,
+            self.join_type,
+            self.join_topology,
+            self.rule_family,
+            self.projection_width,
+            self.render_mode,
+            self.template_pack,
+            tuple(
+                (
+                    join.join_type,
+                    join.left_table,
+                    join.left_alias,
+                    join.left_column,
+                    join.right_table,
+                    join.right_alias,
+                    join.right_column,
+                    join.edge.key,
+                    tuple(
+                        (
+                            predicate.table,
+                            predicate.alias,
+                            predicate.column,
+                            predicate.operator,
+                            _hashable_value(predicate.value),
+                            predicate.family,
+                            predicate.placement,
+                        )
+                        for predicate in join.on_predicates
+                    ),
+                )
+                for join in self.joins
+            ),
+            tuple(
+                (
+                    predicate.table,
+                    predicate.alias,
+                    predicate.column,
+                    predicate.operator,
+                    _hashable_value(predicate.value),
+                    predicate.family,
+                    predicate.placement,
+                )
+                for predicate in self.predicates
+            ),
+            tuple(self.projections),
+        )
+
     def signature(self) -> str:
-        return normalize_sql(self.render_sql())
+        return repr(self.structural_signature())
 
     def render_sql(self) -> str:
         if self.render_mode == "job_like":
@@ -182,9 +275,45 @@ def stage_key(table_count: int) -> str:
     return f"{table_count}_table"
 
 
-def build_projection_options(table_specs: list[TableSchema], aliases: dict[str, str]) -> list[tuple[str, list[tuple[str, str, str]]]]:
-    all_columns = [(table.name, aliases[table.name], column.name) for table in table_specs for column in table.columns.values()]
-    preferred = []
+def _hashable_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(_hashable_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_hashable_value(item) for item in value)
+    return value
+
+
+def _diagnostic_bucket() -> dict[str, int]:
+    return {
+        "generated_before_prune": 0,
+        "retained_before_probe": 0,
+        "probed": 0,
+        "selected": 0,
+        "probe_calls": 0,
+    }
+
+
+def make_build_context(
+    catalog: dict[str, TableSchema],
+    snapshot: StatsSnapshot,
+    config: GeneratorConfig,
+) -> SpjBuildContext:
+    return SpjBuildContext(
+        catalog=catalog,
+        snapshot=snapshot,
+        config=config,
+        seed_templates_by_table={},
+        top_seed_templates_by_table_limit={},
+        projection_templates_by_tables={},
+        paths_by_length={},
+        stars_by_size={},
+        diagnostics=defaultdict(_diagnostic_bucket),
+    )
+
+
+def build_projection_templates(table_specs: list[TableSchema]) -> list[tuple[str, list[tuple[str, str]]]]:
+    all_columns = [(table.name, column.name) for table in table_specs for column in table.columns.values()]
+    preferred: list[tuple[str, str]] = []
     for table in table_specs:
         ordered = sorted(
             table.columns.values(),
@@ -194,7 +323,7 @@ def build_projection_options(table_specs: list[TableSchema], aliases: dict[str, 
                 column.name,
             ),
         )
-        preferred.extend((table.name, aliases[table.name], column.name) for column in ordered)
+        preferred.extend((table.name, column.name) for column in ordered)
     options = []
     if preferred:
         options.append(("narrow", preferred[:1]))
@@ -202,6 +331,20 @@ def build_projection_options(table_specs: list[TableSchema], aliases: dict[str, 
         options.append(("wide", preferred[: min(5, len(preferred))]))
         options.append(("star", all_columns))
     return options
+
+
+def bind_projection_templates(
+    projection_templates: list[tuple[str, list[tuple[str, str]]]],
+    aliases: dict[str, str],
+) -> list[tuple[str, list[tuple[str, str, str]]]]:
+    return [
+        (projection_width, [(table_name, aliases[table_name], column_name) for table_name, column_name in projection_columns])
+        for projection_width, projection_columns in projection_templates
+    ]
+
+
+def build_projection_options(table_specs: list[TableSchema], aliases: dict[str, str]) -> list[tuple[str, list[tuple[str, str, str]]]]:
+    return bind_projection_templates(build_projection_templates(table_specs), aliases)
 
 
 def estimate_from_stats(column: ColumnSchema, stats: ColumnStats | None, family: str) -> float | None:
@@ -309,22 +452,20 @@ def _range_intervals(stats: ColumnStats | None) -> list[tuple[str, Any, float]]:
     return intervals[:MAX_RANGE_PREDICATES_PER_COLUMN]
 
 
-def _build_null_predicates(table: TableSchema, alias: str, column: ColumnSchema, stats: ColumnStats | None) -> list[PredicateSpec]:
+def _build_null_predicates(table: TableSchema, column: ColumnSchema, stats: ColumnStats | None) -> list[SeedTemplate]:
     if not column.nullable or not _meaningful_null_frac(stats):
         return []
     assert stats is not None and stats.null_frac is not None
     return [
-        PredicateSpec(
+        SeedTemplate(
             table=table.name,
-            alias=alias,
             column=column.name,
             operator="is_null",
             family="null",
             selectivity=_clamp_selectivity(stats.null_frac),
         ),
-        PredicateSpec(
+        SeedTemplate(
             table=table.name,
-            alias=alias,
             column=column.name,
             operator="is_not_null",
             family="null",
@@ -333,14 +474,13 @@ def _build_null_predicates(table: TableSchema, alias: str, column: ColumnSchema,
     ]
 
 
-def _build_mcv_predicates(table: TableSchema, alias: str, column: ColumnSchema, stats: ColumnStats | None) -> list[PredicateSpec]:
-    predicates: list[PredicateSpec] = []
+def _build_mcv_predicates(table: TableSchema, column: ColumnSchema, stats: ColumnStats | None) -> list[SeedTemplate]:
+    predicates: list[SeedTemplate] = []
     sampled_entries = _sampled_mcv_entries(stats)
     for value, estimate in sampled_entries:
         predicates.append(
-            PredicateSpec(
+            SeedTemplate(
                 table=table.name,
-                alias=alias,
                 column=column.name,
                 operator="=",
                 value=value,
@@ -350,9 +490,8 @@ def _build_mcv_predicates(table: TableSchema, alias: str, column: ColumnSchema, 
         )
     for values, estimate in _membership_windows(sampled_entries):
         predicates.append(
-            PredicateSpec(
+            SeedTemplate(
                 table=table.name,
-                alias=alias,
                 column=column.name,
                 operator="in",
                 value=values,
@@ -363,15 +502,14 @@ def _build_mcv_predicates(table: TableSchema, alias: str, column: ColumnSchema, 
     return predicates
 
 
-def _build_range_predicates(table: TableSchema, alias: str, column: ColumnSchema, stats: ColumnStats | None) -> list[PredicateSpec]:
+def _build_range_predicates(table: TableSchema, column: ColumnSchema, stats: ColumnStats | None) -> list[SeedTemplate]:
     if not column.is_numeric:
         return []
-    predicates: list[PredicateSpec] = []
+    predicates: list[SeedTemplate] = []
     for operator, value, estimate in _range_intervals(stats):
         predicates.append(
-            PredicateSpec(
+            SeedTemplate(
                 table=table.name,
-                alias=alias,
                 column=column.name,
                 operator=operator,
                 value=value,
@@ -392,22 +530,29 @@ def predicate_selection_score(predicate: PredicateSpec) -> float:
     return closeness + richness
 
 
+def build_seed_templates(
+    table: TableSchema,
+    column_stats: dict[str, ColumnStats],
+) -> list[SeedTemplate]:
+    predicates: list[SeedTemplate] = []
+    for column in sorted(table.columns.values(), key=lambda item: (item.role, item.name)):
+        stats = column_stats.get(column.name)
+        predicates.extend(_build_null_predicates(table, column, stats))
+        predicates.extend(_build_mcv_predicates(table, column, stats))
+        predicates.extend(_build_range_predicates(table, column, stats))
+    deduped: dict[tuple[str, str, str, str], SeedTemplate] = {}
+    for predicate in predicates:
+        key = (predicate.column, predicate.operator, repr(predicate.value), predicate.family)
+        deduped.setdefault(key, predicate)
+    return list(deduped.values())
+
+
 def build_predicate_seeds(
     table: TableSchema,
     alias: str,
     column_stats: dict[str, ColumnStats],
 ) -> list[PredicateSpec]:
-    predicates: list[PredicateSpec] = []
-    for column in sorted(table.columns.values(), key=lambda item: (item.role, item.name)):
-        stats = column_stats.get(column.name)
-        predicates.extend(_build_null_predicates(table, alias, column, stats))
-        predicates.extend(_build_mcv_predicates(table, alias, column, stats))
-        predicates.extend(_build_range_predicates(table, alias, column, stats))
-    deduped: dict[tuple[str, str, str, str], PredicateSpec] = {}
-    for predicate in predicates:
-        key = (predicate.column, predicate.operator, repr(predicate.value), predicate.family)
-        deduped.setdefault(key, predicate)
-    return list(deduped.values())
+    return [bind_seed_template(seed, alias) for seed in build_seed_templates(table, column_stats)]
 
 
 def top_seed_pool(
@@ -416,8 +561,30 @@ def top_seed_pool(
     snapshot: StatsSnapshot,
     *,
     limit: int = 6,
+    build_context: SpjBuildContext | None = None,
 ) -> list[PredicateSpec]:
-    seeds = build_predicate_seeds(table, alias, snapshot.column_stats.get(table.name, {}))
+    if build_context is not None:
+        cache_key = (table.name, limit)
+        if cache_key not in build_context.top_seed_templates_by_table_limit:
+            build_context.top_seed_templates_by_table_limit[cache_key] = _top_seed_templates(
+                table,
+                build_context.seed_templates_by_table.setdefault(
+                    table.name,
+                    build_seed_templates(table, snapshot.column_stats.get(table.name, {})),
+                ),
+                limit=limit,
+            )
+        return [bind_seed_template(seed, alias) for seed in build_context.top_seed_templates_by_table_limit[cache_key]]
+    seeds = build_seed_templates(table, snapshot.column_stats.get(table.name, {}))
+    return [bind_seed_template(seed, alias) for seed in _top_seed_templates(table, seeds, limit=limit)]
+
+
+def _top_seed_templates(
+    table: TableSchema,
+    seeds: list[SeedTemplate],
+    *,
+    limit: int = 6,
+) -> list[SeedTemplate]:
     ranked = sorted(
         seeds,
         key=lambda predicate: (
@@ -486,9 +653,16 @@ def expand_predicate_groups(
     *,
     per_table_seed_limit: int,
     max_predicates_per_query: int,
+    build_context: SpjBuildContext | None = None,
 ) -> list[list[PredicateSpec]]:
     seed_pools = {
-        table_name: top_seed_pool(catalog[table_name], aliases[table_name], snapshot, limit=per_table_seed_limit)
+        table_name: top_seed_pool(
+            catalog[table_name],
+            aliases[table_name],
+            snapshot,
+            limit=per_table_seed_limit,
+            build_context=build_context,
+        )
         for table_name in table_names
     }
     groups: list[list[PredicateSpec]] = [[]]
@@ -516,11 +690,89 @@ def expand_predicate_groups(
     return unique_predicate_groups(groups)
 
 
+def cached_projection_options(
+    table_names: list[str],
+    aliases: dict[str, str],
+    catalog: dict[str, TableSchema],
+    build_context: SpjBuildContext | None = None,
+) -> list[tuple[str, list[tuple[str, str, str]]]]:
+    table_specs = [catalog[table_name] for table_name in table_names]
+    if build_context is None:
+        return build_projection_options(table_specs, aliases)
+    cache_key = tuple(table_names)
+    if cache_key not in build_context.projection_templates_by_tables:
+        build_context.projection_templates_by_tables[cache_key] = build_projection_templates(table_specs)
+    return bind_projection_templates(build_context.projection_templates_by_tables[cache_key], aliases)
+
+
+def probe_oversubscribe_factor(snapshot: StatsSnapshot) -> int:
+    return 4 if snapshot.mode == "stats_plus_selective_probes" and snapshot.provider is not None else 2
+
+
+def topology_retain_limit(stage_budget: int, topology_count: int, snapshot: StatsSnapshot) -> int:
+    if stage_budget <= 0 or topology_count <= 0:
+        return 0
+    return max(MIN_TOPOLOGY_RETAIN, ceil(stage_budget * probe_oversubscribe_factor(snapshot) / topology_count))
+
+
+def _record_generation_stats(
+    build_context: SpjBuildContext | None,
+    stage_id: str,
+    *,
+    generated_before_prune: int,
+    retained_before_probe: int,
+) -> None:
+    if build_context is None:
+        return
+    bucket = build_context.diagnostics[stage_id]
+    bucket["generated_before_prune"] += generated_before_prune
+    bucket["retained_before_probe"] += retained_before_probe
+
+
 def unique_candidates_by_signature(candidates: list[SpjCandidate]) -> list[SpjCandidate]:
-    deduped: dict[str, SpjCandidate] = {}
+    deduped: dict[tuple[Any, ...], SpjCandidate] = {}
     for candidate in candidates:
-        deduped.setdefault(candidate.signature(), candidate)
+        deduped.setdefault(candidate.structural_signature(), candidate)
     return list(deduped.values())
+
+
+def diversity_key(candidate: SpjCandidate) -> tuple[Any, ...]:
+    return (
+        candidate.projection_width,
+        candidate.target_selectivity_bucket,
+        len(candidate.predicates) + sum(len(join.on_predicates) for join in candidate.joins),
+        candidate.rule_family,
+    )
+
+
+def retain_diverse_candidates(
+    candidates: list[SpjCandidate],
+    *,
+    limit: int,
+    seed: int,
+) -> list[SpjCandidate]:
+    if limit <= 0 or len(candidates) <= limit:
+        return unique_candidates_by_signature(candidates)
+    groups: dict[tuple[Any, ...], list[SpjCandidate]] = defaultdict(list)
+    for candidate in sorted(candidates, key=lambda item: (diversity_key(item), item.signature())):
+        groups[diversity_key(candidate)].append(candidate)
+    rng = random.Random(seed)
+    ordered_keys = sorted(groups)
+    rng.shuffle(ordered_keys)
+    for key in ordered_keys:
+        rng.shuffle(groups[key])
+    retained: list[SpjCandidate] = []
+    while ordered_keys and len(retained) < limit:
+        next_round: list[tuple[Any, ...]] = []
+        for key in ordered_keys:
+            if len(retained) >= limit:
+                break
+            if groups[key]:
+                retained.append(groups[key].pop(0))
+            if groups[key]:
+                next_round.append(key)
+        ordered_keys = next_round
+    return unique_candidates_by_signature(retained)
 
 
 def predicate_combinations(predicates: list[PredicateSpec], max_count: int) -> list[list[PredicateSpec]]:
@@ -665,15 +917,22 @@ def build_stage_one_candidates(
     catalog: dict[str, TableSchema],
     snapshot: StatsSnapshot,
     config: GeneratorConfig,
+    build_context: SpjBuildContext | None = None,
 ) -> list[SpjCandidate]:
     candidates: list[SpjCandidate] = []
     for table_name in sorted(catalog):
         table = catalog[table_name]
         aliases = alias_map([table_name])
         alias = aliases[table_name]
-        stats = snapshot.column_stats.get(table_name, {})
-        seeds = build_predicate_seeds(table, alias, stats)
-        projections = build_projection_options([table], aliases)
+        if build_context is not None:
+            seed_templates = build_context.seed_templates_by_table.setdefault(
+                table_name,
+                build_seed_templates(table, snapshot.column_stats.get(table_name, {})),
+            )
+            seeds = [bind_seed_template(seed, alias) for seed in seed_templates]
+        else:
+            seeds = build_predicate_seeds(table, alias, snapshot.column_stats.get(table_name, {}))
+        projections = cached_projection_options([table_name], aliases, catalog, build_context)
         for predicate_group in predicate_combinations(seeds, config.max_predicates_per_table):
             estimated = average_selectivity(predicate_group)
             bucket = bucket_for_selectivity(estimated)
@@ -707,13 +966,17 @@ def build_pair_candidates_for_edge(
     catalog: dict[str, TableSchema],
     snapshot: StatsSnapshot,
     config: GeneratorConfig,
+    *,
+    build_context: SpjBuildContext | None = None,
+    retain_limit: int | None = None,
+    seed_offset: int = 0,
 ) -> list[SpjCandidate]:
     child = catalog[edge.child_table]
     parent = catalog[edge.parent_table]
     child_alias, parent_alias = alias_map([child.name, parent.name]).values()
-    child_seeds = top_seed_pool(child, child_alias, snapshot, limit=6)
-    parent_seeds = top_seed_pool(parent, parent_alias, snapshot, limit=6)
-    projections = build_projection_options([child, parent], {child.name: child_alias, parent.name: parent_alias})
+    child_seeds = top_seed_pool(child, child_alias, snapshot, limit=6, build_context=build_context)
+    parent_seeds = top_seed_pool(parent, parent_alias, snapshot, limit=6, build_context=build_context)
+    projections = cached_projection_options([child.name, parent.name], {child.name: child_alias, parent.name: parent_alias}, catalog, build_context)
     candidates: list[SpjCandidate] = []
 
     if "inner" in config.join_types:
@@ -866,7 +1129,17 @@ def build_pair_candidates_for_edge(
                             calibration_source="pg_stats" if snapshot.column_stats else "schema",
                         )
                     )
-    return unique_candidates_by_signature(candidates)
+    unique = unique_candidates_by_signature(candidates)
+    if retain_limit is None:
+        return unique
+    retained = retain_diverse_candidates(unique, limit=retain_limit, seed=config.seed + seed_offset)
+    _record_generation_stats(
+        build_context,
+        stage_key(2),
+        generated_before_prune=len(unique),
+        retained_before_probe=len(retained),
+    )
+    return retained
 
 
 def undirected_neighbors(join_edges: list[JoinEdge]) -> dict[str, list[JoinEdge]]:
@@ -883,6 +1156,10 @@ def build_path_candidates(
     snapshot: StatsSnapshot,
     join_type: str,
     config: GeneratorConfig,
+    *,
+    build_context: SpjBuildContext | None = None,
+    retain_limit: int | None = None,
+    seed_offset: int = 0,
 ) -> list[SpjCandidate]:
     ordered_tables = [path_edges[0].child_table, path_edges[0].parent_table]
     for edge in path_edges[1:]:
@@ -917,8 +1194,7 @@ def build_path_candidates(
         )
         seen_tables.add(right_table)
 
-    table_specs = [catalog[table_name] for table_name in ordered_tables]
-    projections = build_projection_options(table_specs, aliases)
+    projections = cached_projection_options(ordered_tables, aliases, catalog, build_context)
     predicate_groups = expand_predicate_groups(
         ordered_tables,
         aliases,
@@ -926,6 +1202,7 @@ def build_path_candidates(
         snapshot,
         per_table_seed_limit=4,
         max_predicates_per_query=min(3, max(1, config.max_predicates_per_table)),
+        build_context=build_context,
     )
     rule_family = "join_order_chain" if join_type == "inner" else "left_chain"
     candidates: list[SpjCandidate] = []
@@ -951,7 +1228,17 @@ def build_path_candidates(
                     calibration_source="pg_stats" if snapshot.column_stats else "schema",
                 )
             )
-    return unique_candidates_by_signature(candidates)
+    unique = unique_candidates_by_signature(candidates)
+    if retain_limit is None:
+        return unique
+    retained = retain_diverse_candidates(unique, limit=retain_limit, seed=config.seed + seed_offset)
+    _record_generation_stats(
+        build_context,
+        stage_key(len(ordered_tables)),
+        generated_before_prune=len(unique),
+        retained_before_probe=len(retained),
+    )
+    return retained
 
 
 def enumerate_paths(join_edges: list[JoinEdge], length: int) -> list[list[JoinEdge]]:
@@ -1004,6 +1291,10 @@ def build_star_candidates(
     catalog: dict[str, TableSchema],
     snapshot: StatsSnapshot,
     config: GeneratorConfig,
+    *,
+    build_context: SpjBuildContext | None = None,
+    retain_limit: int | None = None,
+    seed_offset: int = 0,
 ) -> list[SpjCandidate]:
     tables = sorted({edge.child_table for edge in star_edges} | {edge.parent_table for edge in star_edges})
     aliases = alias_map(tables)
@@ -1030,7 +1321,7 @@ def build_star_candidates(
             )
         )
         used.add(right_table)
-    projections = build_projection_options([catalog[table] for table in tables], aliases)
+    projections = cached_projection_options(tables, aliases, catalog, build_context)
     predicate_groups = expand_predicate_groups(
         tables,
         aliases,
@@ -1038,6 +1329,7 @@ def build_star_candidates(
         snapshot,
         per_table_seed_limit=3,
         max_predicates_per_query=min(3, max(1, config.max_predicates_per_table)),
+        build_context=build_context,
     )
     candidates: list[SpjCandidate] = []
     for predicates in predicate_groups:
@@ -1062,7 +1354,17 @@ def build_star_candidates(
                     calibration_source="pg_stats" if snapshot.column_stats else "schema",
                 )
             )
-    return unique_candidates_by_signature(candidates)
+    unique = unique_candidates_by_signature(candidates)
+    if retain_limit is None:
+        return unique
+    retained = retain_diverse_candidates(unique, limit=retain_limit, seed=config.seed + seed_offset)
+    _record_generation_stats(
+        build_context,
+        stage_key(len(tables)),
+        generated_before_prune=len(unique),
+        retained_before_probe=len(retained),
+    )
+    return retained
 
 
 def build_multi_table_candidates(
@@ -1070,18 +1372,63 @@ def build_multi_table_candidates(
     catalog: dict[str, TableSchema],
     snapshot: StatsSnapshot,
     config: GeneratorConfig,
+    *,
+    build_context: SpjBuildContext | None = None,
 ) -> list[SpjCandidate]:
     candidates: list[SpjCandidate] = []
     for table_count in range(3, config.max_join_tables + 1):
-        if config.stage_budgets.get(stage_key(table_count), 0) <= 0:
+        current_stage = stage_key(table_count)
+        stage_budget = config.stage_budgets.get(current_stage, 0)
+        if stage_budget <= 0:
             continue
-        path_edges_list = enumerate_paths(join_edges, table_count - 1)
-        for path_edges in path_edges_list:
-            candidates.extend(build_path_candidates(path_edges, catalog, snapshot, "inner", config))
+        if build_context is not None:
+            path_edges_list = build_context.paths_by_length.setdefault(table_count - 1, enumerate_paths(join_edges, table_count - 1))
+            star_edges_list = build_context.stars_by_size.setdefault(table_count, enumerate_star_edges(join_edges, table_count))
+        else:
+            path_edges_list = enumerate_paths(join_edges, table_count - 1)
+            star_edges_list = enumerate_star_edges(join_edges, table_count)
+        topology_count = len(path_edges_list) + len(star_edges_list)
+        if "left" in config.join_types and table_count == 3:
+            topology_count += len(path_edges_list)
+        retain_limit = topology_retain_limit(stage_budget, topology_count, snapshot)
+        for index, path_edges in enumerate(path_edges_list):
+            candidates.extend(
+                build_path_candidates(
+                    path_edges,
+                    catalog,
+                    snapshot,
+                    "inner",
+                    config,
+                    build_context=build_context,
+                    retain_limit=retain_limit,
+                    seed_offset=(table_count * 1000) + index,
+                )
+            )
             if "left" in config.join_types and table_count == 3:
-                candidates.extend(build_path_candidates(path_edges, catalog, snapshot, "left", config))
-        for star_edges in enumerate_star_edges(join_edges, table_count):
-            candidates.extend(build_star_candidates(star_edges, catalog, snapshot, config))
+                candidates.extend(
+                    build_path_candidates(
+                        path_edges,
+                        catalog,
+                        snapshot,
+                        "left",
+                        config,
+                        build_context=build_context,
+                        retain_limit=retain_limit,
+                        seed_offset=(table_count * 2000) + index,
+                    )
+                )
+        for index, star_edges in enumerate(star_edges_list):
+            candidates.extend(
+                build_star_candidates(
+                    star_edges,
+                    catalog,
+                    snapshot,
+                    config,
+                    build_context=build_context,
+                    retain_limit=retain_limit,
+                    seed_offset=(table_count * 3000) + index,
+                )
+            )
     return unique_candidates_by_signature(candidates)
 
 
@@ -1118,10 +1465,12 @@ def ordered_candidates(candidates: list[SpjCandidate], seed: int) -> list[SpjCan
 def calibrate_candidate(
     candidate: SpjCandidate,
     snapshot: StatsSnapshot,
+    provider: Any | None = None,
 ) -> None:
-    if snapshot.mode != "stats_plus_selective_probes" or snapshot.provider is None:
+    effective_provider = provider or snapshot.provider
+    if snapshot.mode != "stats_plus_selective_probes" or effective_provider is None:
         return
-    row_count = snapshot.provider.probe_count(candidate.render_sql())
+    row_count = effective_provider.probe_count(candidate.render_sql())
     base_table_count = snapshot.table_counts.get(candidate.base_table, 0)
     candidate.observed_rows = row_count
     candidate.observed_selectivity = None if base_table_count == 0 else row_count / base_table_count
@@ -1135,20 +1484,93 @@ def select_candidates_for_stage(
     budget: int,
     seed: int,
     snapshot: StatsSnapshot,
-) -> list[SpjCandidate]:
+    *,
+    probe_workers: int,
+) -> tuple[list[SpjCandidate], dict[str, int]]:
     ordered = ordered_candidates(candidates, seed)
+    diagnostics = _diagnostic_bucket()
+    diagnostics["retained_before_probe"] = len(ordered)
     if snapshot.mode != "stats_plus_selective_probes" or snapshot.provider is None:
-        return ordered[:budget]
+        selected: list[SpjCandidate] = []
+        seen_sql: set[str] = set()
+        for candidate in ordered:
+            sql_signature = normalize_sql(candidate.render_sql())
+            if sql_signature in seen_sql:
+                continue
+            seen_sql.add(sql_signature)
+            selected.append(candidate)
+            if len(selected) >= budget:
+                break
+        diagnostics["selected"] = len(selected)
+        return selected, diagnostics
+
+    provider = snapshot.provider
+    if budget <= 0:
+        return [], diagnostics
+
+    workers = max(1, probe_workers)
+    if workers <= 1 or not hasattr(provider, "clone"):
+        start_calls = getattr(provider, "probe_calls", 0)
+        selected: list[SpjCandidate] = []
+        seen_sql: set[str] = set()
+        for candidate in ordered:
+            calibrate_candidate(candidate, snapshot, provider)
+            diagnostics["probed"] += 1
+            if candidate.observed_rows == 0:
+                continue
+            sql_signature = normalize_sql(candidate.render_sql())
+            if sql_signature in seen_sql:
+                continue
+            seen_sql.add(sql_signature)
+            selected.append(candidate)
+            if len(selected) >= budget:
+                break
+        diagnostics["probe_calls"] = max(0, getattr(provider, "probe_calls", 0) - start_calls)
+        diagnostics["selected"] = len(selected)
+        return selected, diagnostics
+
+    thread_local = threading.local()
+    created_providers: list[Any] = []
+    created_lock = threading.Lock()
+
+    def worker(candidate: SpjCandidate) -> SpjCandidate:
+        worker_provider = getattr(thread_local, "provider", None)
+        if worker_provider is None:
+            worker_provider = provider.clone()
+            thread_local.provider = worker_provider
+            with created_lock:
+                created_providers.append(worker_provider)
+        calibrate_candidate(candidate, snapshot, worker_provider)
+        return candidate
 
     selected: list[SpjCandidate] = []
-    for candidate in ordered:
-        calibrate_candidate(candidate, snapshot)
-        if candidate.observed_rows == 0:
-            continue
-        selected.append(candidate)
-        if len(selected) >= budget:
-            break
-    return selected
+    seen_sql: set[str] = set()
+    batch_size = max(workers, min(len(ordered), max(budget * PROBE_BATCH_MULTIPLIER, workers)))
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for offset in range(0, len(ordered), batch_size):
+                batch = ordered[offset : offset + batch_size]
+                probed_batch = list(executor.map(worker, batch))
+                diagnostics["probed"] += len(probed_batch)
+                for candidate in probed_batch:
+                    if candidate.observed_rows == 0:
+                        continue
+                    sql_signature = normalize_sql(candidate.render_sql())
+                    if sql_signature in seen_sql:
+                        continue
+                    seen_sql.add(sql_signature)
+                    selected.append(candidate)
+                    if len(selected) >= budget:
+                        break
+                if len(selected) >= budget:
+                    break
+    finally:
+        for worker_provider in created_providers:
+            diagnostics["probe_calls"] += getattr(worker_provider, "probe_calls", 0)
+            if hasattr(worker_provider, "close"):
+                worker_provider.close()
+    diagnostics["selected"] = len(selected)
+    return selected, diagnostics
 
 
 def emit_artifacts(
@@ -1159,6 +1581,7 @@ def emit_artifacts(
     schema_path: str,
     suffix: str,
     seed: int,
+    generation_diagnostics: dict[str, dict[str, int]] | None = None,
 ) -> tuple[dict[str, Any], list[QueryArtifact]]:
     artifacts: list[QueryArtifact] = []
     manifest_queries: list[dict[str, Any]] = []
@@ -1178,6 +1601,8 @@ def emit_artifacts(
         "query_count": len(artifacts),
         "queries": manifest_queries,
     }
+    if generation_diagnostics:
+        manifest["generation_diagnostics"] = generation_diagnostics
     return manifest, artifacts
 
 
@@ -1188,11 +1613,31 @@ def generate_spj_workload(
     schema_path: str,
     snapshot: StatsSnapshot,
 ) -> tuple[dict[str, Any], list[QueryArtifact]]:
-    stage_candidates: dict[str, list[SpjCandidate]] = {
-        "1_table": build_stage_one_candidates(catalog, snapshot, config),
-        "2_table": [candidate for edge in join_edges for candidate in build_pair_candidates_for_edge(edge, catalog, snapshot, config)],
-    }
-    for candidate in build_multi_table_candidates(join_edges, catalog, snapshot, config):
+    build_context = make_build_context(catalog, snapshot, config)
+    stage_candidates: dict[str, list[SpjCandidate]] = {}
+
+    stage_one = build_stage_one_candidates(catalog, snapshot, config, build_context=build_context)
+    build_context.diagnostics["1_table"]["generated_before_prune"] = len(stage_one)
+    build_context.diagnostics["1_table"]["retained_before_probe"] = len(stage_one)
+    stage_candidates["1_table"] = stage_one
+
+    stage_two_budget = config.stage_budgets.get("2_table", 0)
+    stage_two_topologies = len(join_edges) * len(config.join_types)
+    stage_two_retain_limit = topology_retain_limit(stage_two_budget, stage_two_topologies, snapshot)
+    stage_candidates["2_table"] = [
+        candidate
+        for edge_index, edge in enumerate(join_edges)
+        for candidate in build_pair_candidates_for_edge(
+            edge,
+            catalog,
+            snapshot,
+            config,
+            build_context=build_context,
+            retain_limit=stage_two_retain_limit,
+            seed_offset=20000 + edge_index,
+        )
+    ]
+    for candidate in build_multi_table_candidates(join_edges, catalog, snapshot, config, build_context=build_context):
         stage_candidates.setdefault(candidate.stage_id, []).append(candidate)
 
     context = {"catalog": catalog, "join_edges": join_edges, "config": config, "snapshot": snapshot}
@@ -1200,6 +1645,7 @@ def generate_spj_workload(
         stage_candidates[stage_id] = unique_candidates_by_signature(
             apply_template_packs(list(config.template_packs), candidates, context)
         )
+        build_context.diagnostics[stage_id]["retained_before_probe"] = len(stage_candidates[stage_id])
 
     selected: list[SpjCandidate] = []
     for table_count in range(1, config.max_join_tables + 1):
@@ -1211,7 +1657,16 @@ def generate_spj_workload(
                 f"Stage {current_stage} requested {budget} queries but only {len(available)} unique candidates were generated "
                 f"from stats-backed predicates (literal fallbacks are disabled)"
             )
-        chosen = select_candidates_for_stage(available, budget, config.seed + table_count, snapshot)
+        chosen, probe_diagnostics = select_candidates_for_stage(
+            available,
+            budget,
+            config.seed + table_count,
+            snapshot,
+            probe_workers=config.probe_workers,
+        )
+        build_context.diagnostics[current_stage]["probed"] = probe_diagnostics["probed"]
+        build_context.diagnostics[current_stage]["probe_calls"] = probe_diagnostics["probe_calls"]
+        build_context.diagnostics[current_stage]["selected"] = probe_diagnostics["selected"]
         if budget > len(chosen):
             raise ValueError(
                 f"Stage {current_stage} requested {budget} non-empty queries but only {len(chosen)} remained after "
@@ -1220,7 +1675,16 @@ def generate_spj_workload(
         selected.extend(chosen)
 
     selected = sorted(unique_candidates_by_signature(selected), key=lambda item: (item.stage_id, item.join_topology, item.join_type, item.signature()))
-    return emit_artifacts(selected, catalog, join_edges, config.benchmark, schema_path, config.suffix, config.seed)
+    return emit_artifacts(
+        selected,
+        catalog,
+        join_edges,
+        config.benchmark,
+        schema_path,
+        config.suffix,
+        config.seed,
+        generation_diagnostics={stage_id: dict(values) for stage_id, values in sorted(build_context.diagnostics.items())},
+    )
 
 
 register_template_pack(JOB_LIKE_TEMPLATE_PACK, append_job_like_join_templates)

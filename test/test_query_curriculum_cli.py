@@ -121,7 +121,25 @@ class QueryCurriculumCliTest(unittest.TestCase):
         )
         cli.run_generate(replace_args)
 
+    def test_probe_workers_flows_into_config(self) -> None:
+        args = cli.parse_args(
+            [
+                "generate",
+                "--benchmarks-root",
+                str(self.benchmarks_root),
+                "--benchmark",
+                "toy",
+                "--suffix",
+                "workers",
+                "--probe-workers",
+                "6",
+            ]
+        )
+
+        config = cli.build_config(args)
+
+        self.assertEqual(config.probe_workers, 6)
+
 
 if __name__ == "__main__":
     unittest.main()
-
