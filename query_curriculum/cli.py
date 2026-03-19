@@ -8,6 +8,7 @@ from typing import Any
 from query_curriculum.core import (
     GeneratorConfig,
     PgConnectionConfig,
+    QueryArtifact,
     close_stats_snapshot,
     default_stage_budgets,
     load_config_file,
@@ -21,6 +22,11 @@ from query_curriculum.core import (
     build_join_edges,
 )
 from query_curriculum.spj import generate_spj_workload
+from query_curriculum.agg import generate_agg_workload
+from query_curriculum.subquery import generate_subquery_workload
+from query_curriculum.setop import generate_setop_workload
+from query_curriculum.window import generate_window_workload
+from query_curriculum.cte import generate_cte_workload
 
 
 REPO_ROOT = repo_root()
@@ -85,6 +91,51 @@ def build_config(args: argparse.Namespace) -> GeneratorConfig:
     )
 
 
+BRANCH_GENERATORS = {
+    "spj": generate_spj_workload,
+    "agg": generate_agg_workload,
+    "subquery": generate_subquery_workload,
+    "setop": generate_setop_workload,
+    "window": generate_window_workload,
+    "cte": generate_cte_workload,
+}
+
+FULL_BRANCH_ORDER = ["spj", "agg", "subquery", "setop", "window", "cte"]
+
+
+def _merge_manifests(
+    manifests: list[tuple[str, dict[str, Any], list[QueryArtifact]]],
+    benchmark: str,
+    schema_path: str,
+    suffix: str,
+    seed: int,
+) -> tuple[dict[str, Any], list[QueryArtifact]]:
+    """Merge manifests and artifacts from multiple branches into one."""
+    all_artifacts: list[QueryArtifact] = []
+    all_queries: list[dict[str, Any]] = []
+    branch_diagnostics: dict[str, Any] = {}
+
+    for branch_name, manifest, artifacts in manifests:
+        all_artifacts.extend(artifacts)
+        all_queries.extend(manifest.get("queries", []))
+        if "generation_diagnostics" in manifest:
+            branch_diagnostics[branch_name] = manifest["generation_diagnostics"]
+
+    merged_manifest = {
+        "branch": "full",
+        "benchmark": benchmark,
+        "schema_path": schema_path,
+        "suffix": suffix,
+        "seed": seed,
+        "query_count": len(all_artifacts),
+        "branches": [name for name, _, _ in manifests],
+        "queries": all_queries,
+    }
+    if branch_diagnostics:
+        merged_manifest["generation_diagnostics"] = branch_diagnostics
+    return merged_manifest, all_artifacts
+
+
 def run_generate(args: argparse.Namespace) -> dict[str, Any]:
     config = build_config(args)
     benchmark_dir = resolve_benchmark_dir(config.benchmarks_root, config.benchmark)
@@ -94,9 +145,33 @@ def run_generate(args: argparse.Namespace) -> dict[str, Any]:
     join_edges = build_join_edges(catalog)
     snapshot = load_stats_snapshot(config, catalog)
     try:
-        if config.branch != "spj":
-            raise ValueError(f"Unsupported branch: {config.branch}")
-        manifest, artifacts = generate_spj_workload(catalog, join_edges, config, str(schema_path), snapshot)
+        if config.branch == "full":
+            # Run all generators and merge
+            results: list[tuple[str, dict[str, Any], list[QueryArtifact]]] = []
+            for branch_name in FULL_BRANCH_ORDER:
+                generator = BRANCH_GENERATORS[branch_name]
+                manifest, artifacts = generator(catalog, join_edges, config, str(schema_path), snapshot)
+                results.append((branch_name, manifest, artifacts))
+            manifest, artifacts = _merge_manifests(
+                results, config.benchmark, str(schema_path), config.suffix, config.seed,
+            )
+        elif config.branch in BRANCH_GENERATORS:
+            generator = BRANCH_GENERATORS[config.branch]
+            manifest, artifacts = generator(catalog, join_edges, config, str(schema_path), snapshot)
+        else:
+            raise ValueError(f"Unsupported branch: {config.branch}. "
+                             f"Choose from: {', '.join(list(BRANCH_GENERATORS) + ['full'])}")
+
+        # Optional plan collection
+        if getattr(args, 'collect_plans', False) and config.pg and config.pg.enabled:
+            from query_curriculum.plan_collector import collect_plans_for_manifest
+            plans = collect_plans_for_manifest(
+                config.pg, manifest, artifacts,
+                use_pg_hint_plan=getattr(args, 'use_pg_hint_plan', True),
+                max_alternatives=getattr(args, 'max_plan_alternatives', 5),
+            )
+            manifest["plans"] = plans
+
         write_output(output_dir, manifest, artifacts, replace_output=config.replace_output)
         return {"output_dir": str(output_dir), "query_count": len(artifacts), "schema_path": str(schema_path)}
     finally:
@@ -120,7 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--stage-budget", action="append", default=None, help="Override stage budget, e.g. 2_table=12")
     generate.add_argument("--max-predicates-per-table", type=int, default=None)
     generate.add_argument("--probe-workers", type=int, default=None)
-    generate.add_argument("--stats-mode", choices=["auto", "schema_only", "stats_only", "stats_plus_selective_probes"], default=None)
+    generate.add_argument("--stats-mode", choices=["auto", "schema_only", "stats_only", "stats_plus_selective_probes", "stats_plus_estimated_probes"], default=None)
     generate.add_argument("--pg-enabled", action="store_true")
     generate.add_argument("--pg-host", type=str, default=None)
     generate.add_argument("--pg-port", type=int, default=None)
@@ -128,6 +203,10 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--pg-password", type=str, default=None)
     generate.add_argument("--pg-database", type=str, default=None)
     generate.add_argument("--template-pack", action="append", default=None)
+    generate.add_argument("--collect-plans", action="store_true", help="Collect EXPLAIN plans for generated queries")
+    generate.add_argument("--use-pg-hint-plan", action="store_true", default=True, help="Use pg_hint_plan for alternative plans")
+    generate.add_argument("--no-pg-hint-plan", action="store_false", dest="use_pg_hint_plan", help="Disable pg_hint_plan hints")
+    generate.add_argument("--max-plan-alternatives", type=int, default=5, help="Max alternative plans per query")
     return parser
 
 

@@ -730,7 +730,12 @@ def cached_projection_options(
 
 
 def probe_oversubscribe_factor(snapshot: StatsSnapshot) -> int:
-    return 4 if snapshot.mode == "stats_plus_selective_probes" and snapshot.provider is not None else 2
+    if snapshot.provider is not None:
+        if snapshot.mode == "stats_plus_estimated_probes":
+            return 6
+        if snapshot.mode == "stats_plus_selective_probes":
+            return 4
+    return 2
 
 
 def topology_retain_limit(stage_budget: int, topology_count: int, snapshot: StatsSnapshot) -> int:
@@ -742,8 +747,11 @@ def topology_retain_limit(stage_budget: int, topology_count: int, snapshot: Stat
 def stage_pool_limit(stage_id: str, stage_budget: int, snapshot: StatsSnapshot) -> int:
     if stage_budget <= 0:
         return 0
-    if stage_id in {"1_table", "2_table"} and snapshot.mode == "stats_plus_selective_probes" and snapshot.provider is not None:
-        return max(stage_budget * 4, 32)
+    if snapshot.provider is not None and stage_id in {"1_table", "2_table"}:
+        if snapshot.mode == "stats_plus_estimated_probes":
+            return max(stage_budget * 6, 48)
+        if snapshot.mode == "stats_plus_selective_probes":
+            return max(stage_budget * 4, 32)
     if stage_id == "1_table":
         return max(stage_budget * 2, 24)
     return max(stage_budget * 2, 24)
@@ -1642,15 +1650,23 @@ def calibrate_candidate(
     provider: Any | None = None,
 ) -> None:
     effective_provider = provider or snapshot.provider
-    if snapshot.mode != "stats_plus_selective_probes" or effective_provider is None:
+    if effective_provider is None:
         return
-    row_count = effective_provider.probe_count(candidate.render_sql())
+    if snapshot.mode == "stats_plus_selective_probes":
+        row_count = effective_provider.probe_count(candidate.render_sql())
+    elif snapshot.mode == "stats_plus_estimated_probes":
+        try:
+            row_count = effective_provider.probe_estimate(candidate.render_sql())
+        except Exception:
+            return
+    else:
+        return
     base_table_count = snapshot.table_counts.get(candidate.base_table, 0)
-    candidate.observed_rows = row_count
+    candidate.observed_rows = int(row_count)
     candidate.observed_selectivity = None if base_table_count == 0 else row_count / base_table_count
     candidate.target_selectivity_bucket = bucket_for_selectivity(candidate.observed_selectivity)
     candidate.calibrated = True
-    candidate.calibration_source = "probe"
+    candidate.calibration_source = "probe" if snapshot.mode == "stats_plus_selective_probes" else "estimate"
 
 
 def select_candidates_for_stage(
@@ -1665,10 +1681,14 @@ def select_candidates_for_stage(
     ordered = ordered_candidates(candidates, seed)
     diagnostics = _diagnostic_bucket()
     diagnostics["retained_before_probe"] = len(ordered)
+    probe_modes = {"stats_plus_selective_probes", "stats_plus_estimated_probes"}
+    selective_stages = {"1_table", "2_table"}
+    estimated_stages = {"1_table", "2_table", "3_table", "4_table"}
+    probe_stages = estimated_stages if snapshot.mode == "stats_plus_estimated_probes" else selective_stages
     should_probe = (
-        snapshot.mode == "stats_plus_selective_probes"
+        snapshot.mode in probe_modes
         and snapshot.provider is not None
-        and stage_id in {"1_table", "2_table"}
+        and stage_id in probe_stages
     )
     if not should_probe:
         selected: list[SpjCandidate] = []

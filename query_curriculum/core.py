@@ -415,6 +415,16 @@ class PostgresStatsProvider:
         rows = self.query_rows(f"SELECT COUNT(*) FROM ({query}) AS curriculum_probe;")
         return int(rows[0][0]) if rows else 0
 
+    def probe_estimate(self, sql: str) -> float:
+        """EXPLAIN-based estimated row count (no execution)."""
+        self.probe_calls += 1
+        query = sql.strip().rstrip(";")
+        rows = self.query_rows(f"EXPLAIN (FORMAT JSON) {query}")
+        plan_json = rows[0][0]
+        if isinstance(plan_json, str):
+            plan_json = json.loads(plan_json)
+        return float(plan_json[0]["Plan"]["Plan Rows"])
+
 
 def load_stats_snapshot(config: GeneratorConfig, catalog: dict[str, TableSchema]) -> StatsSnapshot:
     mode = resolve_stats_mode(config)
@@ -437,7 +447,7 @@ def load_stats_snapshot(config: GeneratorConfig, catalog: dict[str, TableSchema]
         )
     except Exception as exc:
         provider.close()
-        if mode in {"stats_only", "stats_plus_selective_probes"}:
+        if mode in {"stats_only", "stats_plus_selective_probes", "stats_plus_estimated_probes"}:
             raise RuntimeError(
                 f"Failed to load PostgreSQL stats for {mode}; SPJ predicate generation now requires real stats "
                 "when PostgreSQL-backed generation is enabled"
