@@ -82,7 +82,9 @@ def _normalize_literal_value(value: Any) -> str:
     return normalized
 
 
-def _render_scalar_token(expr: dict[str, Any]) -> str:
+def _render_scalar_token(expr: dict[str, Any] | int) -> str:
+    if isinstance(expr, int):
+        return f"[INPUT_{expr}]"
     if "global_ids" in expr and expr["global_ids"]:
         return f"[G{expr['global_ids'][0]['global_id']}]"
 

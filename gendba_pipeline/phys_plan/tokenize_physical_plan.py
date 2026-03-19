@@ -55,6 +55,7 @@ _LOGICAL_TO_PHYS_DEFAULT: dict[str, str] = {
     "LogicalAggregate": "HashAggregate",
     "LogicalSort": "Sort",
     "LogicalLimit": "Limit",
+    "LogicalTableScan": "SeqScan",
 }
 
 # ---------------------------------------------------------------------------
@@ -243,8 +244,8 @@ def _get_unary_op(pg_label: str, attrs: dict) -> str:
 # Core traversal
 # ---------------------------------------------------------------------------
 
-# Entry = (ir_ptr, phys_op, join_type_or_None)
-Entry = tuple[int, str, str | None]
+# Entry = (ir_ptr, phys_op, join_type_or_None, child_ir_ptrs_or_None)
+Entry = tuple[int, str, str | None, list[int] | None]
 
 
 def _traverse(
@@ -253,12 +254,13 @@ def _traverse(
     ptr_costs: dict[int, int],
     used_ir_ptrs: set[int],
     ir_nodes: dict[int, IRNode],
-    scan_map: dict[int, int],
+    scan_map: dict[int, list[int]],
     join_map: dict[tuple[int, int], int],
     unary_map: dict[tuple[int, str], list[int]],
     table_name_to_id: dict[str, int],
     subquery_filters: list[int] | None = None,
     ctx: _TraversalCtx | None = None,
+    ir_table_coverage: dict[int, frozenset[int]] | None = None,
 ) -> tuple[list[Entry], int | None, set[int]]:
     """Post-order traversal of PG plan tree.
 
@@ -275,7 +277,8 @@ def _traverse(
         for child in node.get("_children", []):
             ce, cp, ct = _traverse(child, op_card, ptr_costs, used_ir_ptrs,
                                ir_nodes, scan_map, join_map, unary_map,
-                               table_name_to_id, subquery_filters, ctx)
+                               table_name_to_id, subquery_filters, ctx,
+                               ir_table_coverage)
             all_entries.extend(ce)
             all_tables |= ct
             if cp is not None:
@@ -288,7 +291,7 @@ def _traverse(
         child_results.append(_traverse(
             child, op_card, ptr_costs, used_ir_ptrs,
             ir_nodes, scan_map, join_map, unary_map, table_name_to_id,
-            subquery_filters, ctx,
+            subquery_filters, ctx, ir_table_coverage,
         ))
 
     combined: list[Entry] = []
@@ -319,8 +322,13 @@ def _traverse(
     if label == "TableScan":
         table_name = attrs.get("table_name") or sys_dict.get("Relation Name", "")
         table_id = table_name_to_id.get(table_name)
-        ir_ptr = scan_map.get(table_id) if table_id is not None else None
-        if ir_ptr is None or ir_ptr in used_ir_ptrs:
+        ir_ptr: int | None = None
+        if table_id is not None:
+            for cand in scan_map.get(table_id, []):
+                if cand not in used_ir_ptrs:
+                    ir_ptr = cand
+                    break
+        if ir_ptr is None:
             return combined, child_ir_ptrs[-1] if child_ir_ptrs else None, all_child_tables
 
         node_type = sys_dict.get("Node Type", "")
@@ -342,7 +350,7 @@ def _traverse(
             if alias:
                 ctx.alias_to_table[alias] = table_name
 
-        return combined + [(ir_ptr, phys_op, None)], ir_ptr, table_set | all_child_tables
+        return combined + [(ir_ptr, phys_op, None, None)], ir_ptr, table_set | all_child_tables
 
     # ---- Join ----
     if label == "Join":
@@ -352,7 +360,12 @@ def _traverse(
         key = (child_ir_ptrs[0], child_ir_ptrs[1])
         ir_ptr = join_map.get(key)
         if ir_ptr is None or ir_ptr in used_ir_ptrs:
-            ir_ptr = _find_any_unused_join(ir_nodes, used_ir_ptrs)
+            # Coverage-based fallback: match by which tables the subtrees cover
+            if ir_table_coverage is not None and all_child_tables:
+                ir_ptr = _find_join_by_coverage(
+                    all_child_tables, ir_nodes, ir_table_coverage, used_ir_ptrs)
+            if ir_ptr is None or ir_ptr in used_ir_ptrs:
+                ir_ptr = _find_any_unused_join(ir_nodes, used_ir_ptrs)
         # Fallback: PG may have decorrelated an EXISTS/IN subquery into a
         # join.  The IR has no LogicalJoin — only a LogicalFilter owning a
         # [SUBQUERY] block.  Match it here.
@@ -384,7 +397,7 @@ def _traverse(
                                used_ir_ptrs, ptr_costs)
         used_ir_ptrs.add(ir_ptr)
         ptr_costs[ir_ptr] = cardinality
-        return combined + fused + [(ir_ptr, phys_op, join_type)], ir_ptr, all_child_tables
+        return combined + fused + [(ir_ptr, phys_op, join_type, list(child_ir_ptrs))], ir_ptr, all_child_tables
 
     # ---- Unary: GroupBy, Sort, Limit, Filter ----
     child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
@@ -410,7 +423,7 @@ def _traverse(
                            used_ir_ptrs, ptr_costs)
     used_ir_ptrs.add(ir_ptr)
     ptr_costs[ir_ptr] = cardinality
-    return combined + fused + [(ir_ptr, phys_op, None)], ir_ptr, all_child_tables
+    return combined + fused + [(ir_ptr, phys_op, None, None)], ir_ptr, all_child_tables
 
 
 # ---------------------------------------------------------------------------
@@ -500,10 +513,13 @@ def _collect_fused(
         node = ir_nodes.get(inp)
         if node is None:
             continue
+        # Table scans and joins must only be matched by their own handlers
+        if node.op in ("LogicalTableScan", "LogicalJoin"):
+            continue
         phys_op = _LOGICAL_TO_PHYS_DEFAULT.get(node.op, "Filter")
         used_ir_ptrs.add(inp)
         ptr_costs.setdefault(inp, 1)
-        fused.append((inp, phys_op, None))
+        fused.append((inp, phys_op, None, None))
         stack.extend(node.inputs)
 
     fused.reverse()  # topological: leaves first
@@ -538,18 +554,16 @@ def _insert_missing_ptrs(
         node = ir_nodes[ptr]
         ptr_costs.setdefault(ptr, 1)
         if node.op == "LogicalTableScan":
-            extra.append((ptr, "SeqScan", None))
+            extra.append((ptr, "SeqScan", None, None))
         elif node.op == "LogicalJoin":
             jt = node.join_type or "[INNER]"
-            extra.append((ptr, "HashJoin", jt))
+            extra.append((ptr, "HashJoin", jt, list(node.inputs)))
         else:
             phys_op = _LOGICAL_TO_PHYS_DEFAULT.get(node.op, "Filter")
-            extra.append((ptr, phys_op, None))
+            extra.append((ptr, phys_op, None, None))
 
-    all_entries = entries + extra
-    ir_order = {ptr: i for i, ptr in enumerate(sorted(ir_nodes.keys()))}
-    all_entries.sort(key=lambda e: ir_order.get(e[0], 999))
-    return all_entries
+    # Preserve PG post-order for matched entries; missing PTRs appended at end.
+    return entries + extra
 
 
 # ---------------------------------------------------------------------------
@@ -559,20 +573,20 @@ def _insert_missing_ptrs(
 def _build_matching_maps(
     ir_nodes: dict[int, IRNode],
 ) -> tuple[
-    dict[int, int],
+    dict[int, list[int]],
     dict[tuple[int, int], int],
     dict[tuple[int, str], list[int]],
     list[int],
 ]:
     """Build scan_map, join_map, unary_map, subquery_filters from parsed IR nodes."""
-    scan_map: dict[int, int] = {}
+    scan_map: dict[int, list[int]] = {}
     join_map: dict[tuple[int, int], int] = {}
     unary_map: dict[tuple[int, str], list[int]] = {}
     subquery_filters: list[int] = []
 
     for ptr, node in ir_nodes.items():
         if node.op == "LogicalTableScan" and node.table_id is not None:
-            scan_map[node.table_id] = ptr
+            scan_map.setdefault(node.table_id, []).append(ptr)
         elif node.op == "LogicalJoin" and len(node.inputs) == 2:
             k = (node.inputs[0], node.inputs[1])
             join_map[k] = ptr
@@ -591,6 +605,73 @@ def _build_matching_maps(
             unary_map.setdefault((child, "_any"), []).append(ptr)
 
     return scan_map, join_map, unary_map, subquery_filters
+
+
+# ---------------------------------------------------------------------------
+# IR table coverage (for join matching by subtree tables)
+# ---------------------------------------------------------------------------
+
+def _build_ir_table_coverage(
+    ir_nodes: dict[int, IRNode],
+) -> dict[int, frozenset[int]]:
+    """Compute ``{ptr: frozenset[table_ids]}`` for every IR node.
+
+    Walks inputs down to ``LogicalTableScan`` leaves via memoized DFS.
+    """
+    cache: dict[int, frozenset[int]] = {}
+
+    def _cover(ptr: int) -> frozenset[int]:
+        if ptr in cache:
+            return cache[ptr]
+        node = ir_nodes.get(ptr)
+        if node is None:
+            cache[ptr] = frozenset()
+            return cache[ptr]
+        if node.op == "LogicalTableScan" and node.table_id is not None:
+            cache[ptr] = frozenset({node.table_id})
+            return cache[ptr]
+        tables: set[int] = set()
+        for inp in node.inputs:
+            tables |= _cover(inp)
+        cache[ptr] = frozenset(tables)
+        return cache[ptr]
+
+    for ptr in ir_nodes:
+        _cover(ptr)
+    return cache
+
+
+def _find_join_by_coverage(
+    all_child_tables: set[int],
+    ir_nodes: dict[int, IRNode],
+    ir_table_coverage: dict[int, frozenset[int]],
+    used: set[int],
+) -> int | None:
+    """Find an unused LogicalJoin whose IR table coverage matches the PG join's tables.
+
+    Prefers exact match; falls back to smallest superset.
+    """
+    target = frozenset(all_child_tables)
+    best_ptr: int | None = None
+    best_extra = float('inf')
+
+    for ptr, node in ir_nodes.items():
+        if ptr in used or node.op != "LogicalJoin":
+            continue
+        coverage = ir_table_coverage.get(ptr, frozenset())
+        if not coverage:
+            continue
+        # Must cover all child tables
+        if not target <= coverage:
+            continue
+        extra = len(coverage) - len(target)
+        if extra == 0:
+            return ptr  # exact match — use immediately
+        if extra < best_extra:
+            best_extra = extra
+            best_ptr = ptr
+
+    return best_ptr
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +703,7 @@ def _assign_predicates(
     assigned: set[int] = set()
 
     # --- Pass 1: INDEX_COND on IndexScan operators --------------------------
-    for ptr, (_, phys_op, _) in entry_map.items():
+    for ptr, (_, phys_op, _, _) in entry_map.items():
         if phys_op not in ("IndexScan", "IndexOnlyScan"):
             continue
         sys_rep = ctx.entry_sys_reps.get(ptr, {})
@@ -693,7 +774,7 @@ def _assign_predicates(
                     best_ptr = j_ptr
 
         if best_ptr is not None:
-            _, phys_op, _ = entry_map[best_ptr]
+            _, phys_op, _, _ = entry_map[best_ptr]
             if phys_op == "HashJoin":
                 role = "HASH_COND"
             elif phys_op == "MergeJoin":
@@ -746,6 +827,7 @@ def tokenize_physical_plan(
                 op_card[op_id] = float(op.get("actual_rows_total", 0.0))
 
         scan_map, join_map, unary_map, subquery_filters = _build_matching_maps(ir_nodes)
+        ir_table_coverage = _build_ir_table_coverage(ir_nodes)
 
         ptr_costs: dict[int, int] = {}
         used_ir_ptrs: set[int] = set()
@@ -755,6 +837,7 @@ def tokenize_physical_plan(
             tree, op_card, ptr_costs, used_ir_ptrs,
             ir_nodes, scan_map, join_map, unary_map,
             table_name_to_id, subquery_filters, ctx,
+            ir_table_coverage,
         )
 
         # Insert any missing IR PTRs
@@ -772,13 +855,15 @@ def tokenize_physical_plan(
 
         # Flatten to token string
         lines = ["[PHYSICAL_PLAN]"]
-        for ir_ptr, phys_op, join_type in entries:
+        for ir_ptr, phys_op, join_type, child_ptrs in entries:
             tok = f"  [PTR_{ir_ptr}] {phys_op}"
             if join_type:
                 tok += f" {join_type}"
             for role, preds in sorted(pred_annotations.get(ir_ptr, {}).items()):
                 tok += f" [{role} {' '.join(f'P_{p}' for p in preds)}]"
             lines.append(tok)
+            if child_ptrs:
+                lines.append(f"    [INPUT] {' '.join(f'[PTR_{p}]' for p in child_ptrs)}")
         lines.append("[/PHYSICAL_PLAN]")
         return "\n".join(lines)
 
