@@ -144,6 +144,14 @@ def main() -> None:
                             print(f"    {line}")
                     print()
 
+                cardinalities = row.get("ir_physical_plan_cardinalities", {})
+                if cardinalities:
+                    print("PHYSICAL PLAN CARDINALITIES:")
+                    for engine, cards in cardinalities.items():
+                        print(f"  Engine: {engine}")
+                        print(f"    {cards}")
+                    print()
+
     missing = wanted - found  # both sets use stems
     if missing:
         print(f"Warning: no records found for: {', '.join(sorted(missing))}", file=sys.stderr)

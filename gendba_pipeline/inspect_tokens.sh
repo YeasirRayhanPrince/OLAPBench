@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JSONL="$SCRIPT_DIR/output/gendba_local_postgres_preloaded/gendba_pool.training.jsonl"
 
 QUERIES=(
+    exists
     # tokenizer_001_cte_rollup
     # tokenizer_002_correlated_exists
     # tokenizer_003_lateral_top_cast
@@ -26,7 +27,7 @@ QUERIES=(
     # tokenizer_016_join_title_keyword
     # tokenizer_017_join_title_info_aka
     # tokenizer_018_join_cast_role_name
-    tokenizer_019_join_company_type
+    # tokenizer_019_join_company_type
     # tokenizer_020_join_movie_link
     # tokenizer_021_implicit_join_title_keyword
     # tokenizer_022_implicit_join_cast_name

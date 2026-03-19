@@ -441,14 +441,17 @@ def _iter_training_and_manifest_rows(
 
         # Tokenize physical plans
         phys_token_strs: dict[str, str] = {}
+        phys_cardinalities: dict[str, list[int]] = {}
         if table_name_to_id_by_group:
             tbl_map = table_name_to_id_by_group.get(entry.group_key, {})
             pred_reg = logical_record.get("pred_registry")
             for engine_key, raw_phys in physical_token_map.items():
-                tok = tokenize_physical_plan(logical_ir, raw_phys, tbl_map,
-                                             pred_registry=pred_reg)
-                if tok:
+                result = tokenize_physical_plan(logical_ir, raw_phys, tbl_map,
+                                                pred_registry=pred_reg)
+                if result:
+                    tok, cards = result
                     phys_token_strs[engine_key] = tok
+                    phys_cardinalities[engine_key] = cards
 
         training_row = {
             "id": next_id,
@@ -458,6 +461,7 @@ def _iter_training_and_manifest_rows(
             "ir_logical_token": logical_ir,
             "ir_physical_token": physical_token_map,
             "ir_physical_plan_token": phys_token_strs,
+            "ir_physical_plan_cardinalities": phys_cardinalities,
         }
 
         manifest_row = {

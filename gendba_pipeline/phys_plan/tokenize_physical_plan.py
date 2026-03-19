@@ -737,6 +737,23 @@ def _assign_predicates(
             if scan_tid in pred_tables and other_tids & pred_tables:
                 annotations.setdefault(ptr, {}).setdefault("INDEX_COND", []).append(pred["pred_id"])
                 assigned.add(pred["pred_id"])
+                # Also assign to the parent join if this predicate straddles
+                # both sides (e.g. EXISTS decorrelated into NestedLoop).
+                for j_ptr, (lt, rt) in ctx.join_children_tables.items():
+                    if j_ptr not in entry_map:
+                        continue
+                    if (pred_tables & lt) and (pred_tables & rt):
+                        _, j_phys_op, _, _ = entry_map[j_ptr]
+                        if j_phys_op == "HashJoin":
+                            role = "HASH_COND"
+                        elif j_phys_op == "MergeJoin":
+                            role = "MERGE_COND"
+                        elif j_phys_op == "NestedLoop":
+                            role = "JOIN_FILTER"
+                        else:
+                            role = "HASH_COND"
+                        annotations.setdefault(j_ptr, {}).setdefault(role, []).append(pred["pred_id"])
+                        break
                 break  # one index cond per scan
 
     # --- Pass 2: Selection predicates → FILTER on scan ----------------------
@@ -798,7 +815,7 @@ def tokenize_physical_plan(
     pg_physical: dict,
     table_name_to_id: dict[str, int],
     pred_registry: list[dict] | None = None,
-) -> str | None:
+) -> tuple[str, list[int]] | None:
     """Convert a PG EXPLAIN plan into a ``[PHYSICAL_PLAN] … [/PHYSICAL_PLAN]`` string.
 
     Args:
@@ -808,7 +825,9 @@ def tokenize_physical_plan(
         pred_registry:    Optional predicate metadata from logical tokenization.
 
     Returns:
-        Token string or ``None`` on failure.
+        ``(token_string, cardinalities)`` or ``None`` on failure.
+        ``cardinalities`` is a per-PTR list of actual rows, ordered to
+        match the PTR entries in the token string.
     """
     try:
         tree = pg_physical.get("plan", {}).get("queryPlan")
@@ -853,6 +872,9 @@ def tokenize_physical_plan(
         if pred_registry:
             pred_annotations = _assign_predicates(entries, pred_registry, ctx, table_name_to_id)
 
+        # Build per-PTR cardinality array (actual rows, default 1)
+        cardinalities = [ptr_costs.get(e[0], 1) for e in entries]
+
         # Flatten to token string
         lines = ["[PHYSICAL_PLAN]"]
         for ir_ptr, phys_op, join_type, child_ptrs in entries:
@@ -865,7 +887,7 @@ def tokenize_physical_plan(
             if child_ptrs:
                 lines.append(f"    [INPUT] {' '.join(f'[PTR_{p}]' for p in child_ptrs)}")
         lines.append("[/PHYSICAL_PLAN]")
-        return "\n".join(lines)
+        return ("\n".join(lines), cardinalities)
 
     except Exception as e:
         print(f"Error tokenizing physical plan: {e}")
@@ -901,14 +923,18 @@ def tokenize_training_jsonl(
 
             pred_reg = row.get("pred_registry")
             phys_token_strs: dict[str, str] = {}
+            phys_cardinalities: dict[str, list[int]] = {}
             if raw_phys and ir_logical:
-                tok = tokenize_physical_plan(ir_logical, raw_phys, table_name_to_id,
-                                             pred_registry=pred_reg)
-                if tok:
+                result = tokenize_physical_plan(ir_logical, raw_phys, table_name_to_id,
+                                                pred_registry=pred_reg)
+                if result:
+                    tok, cards = result
                     phys_token_strs[engine_key] = tok
+                    phys_cardinalities[engine_key] = cards
                     count += 1
 
             row["ir_physical_plan_token"] = phys_token_strs
+            row["ir_physical_plan_cardinalities"] = phys_cardinalities
             fout.write(json.dumps(row))
             fout.write("\n")
 
