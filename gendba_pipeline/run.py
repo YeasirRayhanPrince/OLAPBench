@@ -28,6 +28,10 @@ from benchmarks.benchmark import benchmarks as benchmark_descriptions
 from gendba_pipeline.build_calcite_training_jsonl import (
     build_calcite_training_records,
 )
+from gendba_pipeline.phys_plan.tokenize_physical_plan import (
+    load_table_name_to_id,
+    tokenize_physical_plan,
+)
 from util.template import Template, unfold
 
 
@@ -411,6 +415,7 @@ def _iter_training_and_manifest_rows(
     logical_records: dict[str, dict[str, Any]],
     physical_tokens_by_engine: dict[str, dict[str, dict[str, Any]]],
     physical_sources_by_engine: dict[str, dict[str, dict[str, Any]]],
+    table_name_to_id_by_group: dict[str, dict[str, int]] | None = None,
 ):
     next_id = 1
 
@@ -432,13 +437,27 @@ def _iter_training_and_manifest_rows(
             if source is not None:
                 physical_source_map[engine_key] = source
 
+        logical_ir = logical_record["logical_tokenized_plan"]
+
+        # Tokenize physical plans
+        phys_token_strs: dict[str, str] = {}
+        if table_name_to_id_by_group:
+            tbl_map = table_name_to_id_by_group.get(entry.group_key, {})
+            pred_reg = logical_record.get("pred_registry")
+            for engine_key, raw_phys in physical_token_map.items():
+                tok = tokenize_physical_plan(logical_ir, raw_phys, tbl_map,
+                                             pred_registry=pred_reg)
+                if tok:
+                    phys_token_strs[engine_key] = tok
+
         training_row = {
             "id": next_id,
             "schema": entry.schema,
             "sql_file_name": entry.query_id,
             "sql": entry.sql,
-            "ir_logical_token": logical_record["logical_tokenized_plan"],
+            "ir_logical_token": logical_ir,
             "ir_physical_token": physical_token_map,
+            "ir_physical_plan_token": phys_token_strs,
         }
 
         manifest_row = {
@@ -488,6 +507,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     groups, query_entries = _resolve_query_groups(spec)
     systems = _resolve_systems(spec)
 
+    table_name_to_id_by_group: dict[str, dict[str, int]] = {}
     logical_records: dict[str, dict[str, Any]] = {}
     for group in groups:
         calcite_output_dir = work_root / "calcite" / group.group_key
@@ -500,6 +520,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             work_dir=str(calcite_output_dir / "plans"),
             keep_work_dir=True,
         )
+        table_name_to_id_by_group[group.group_key] = load_table_name_to_id(group.schema_path)
         for record in records:
             logical_records[f"{group.group_key}:{record['query_key']}"] = record
 
@@ -562,6 +583,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         logical_records=logical_records,
         physical_tokens_by_engine=physical_tokens_by_engine,
         physical_sources_by_engine=physical_sources_by_engine,
+        table_name_to_id_by_group=table_name_to_id_by_group,
     ):
         training_batch.append(training_row)
         manifest_batch.append(manifest_row)

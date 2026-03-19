@@ -29,6 +29,7 @@ from query_curriculum.spj import (
     make_build_context,
     retain_diverse_candidates,
     top_seed_pool,
+    unique_candidates_by_signature,
 )
 
 
@@ -470,6 +471,48 @@ class QueryCurriculumSpjTest(unittest.TestCase):
         self.assertGreater(diagnostics["1_table"]["probe_calls"], 0)
         self.assertGreater(diagnostics["2_table"]["probe_calls"], 0)
 
+    def test_multi_table_stages_skip_live_probing(self) -> None:
+        config = GeneratorConfig(
+            benchmark="toy",
+            suffix="stage_probe_policy",
+            max_join_tables=3,
+            stage_budgets={"1_table": 2, "2_table": 2, "3_table": 2},
+            seed=23,
+            probe_workers=3,
+            stats_mode="stats_plus_selective_probes",
+        )
+        provider = CountingProbeProvider()
+        snapshot = StatsSnapshot(
+            mode="stats_plus_selective_probes",
+            table_counts={"customers": 100, "orders": 100, "lineitem": 100, "part": 100},
+            column_stats={
+                "customers": {"segment": ColumnStats(most_common_vals=["AUTO"], most_common_freqs=[0.2])},
+                "orders": {"order_status": ColumnStats(most_common_vals=["F"], most_common_freqs=[0.3])},
+                "lineitem": {"quantity": ColumnStats(histogram_bounds=[1, 2, 5, 10, 20, 40])},
+            },
+            provider=provider,
+        )
+
+        manifest, artifacts = generate_spj_workload(self.catalog, self.join_edges, config, str(self.schema_path), snapshot)
+
+        self.assertEqual(len(artifacts), 6)
+        diagnostics = manifest["generation_diagnostics"]
+        self.assertGreater(diagnostics["1_table"]["probe_calls"], 0)
+        self.assertGreater(diagnostics["2_table"]["probe_calls"], 0)
+        self.assertEqual(diagnostics["3_table"]["probe_calls"], 0)
+        stage_three_queries = [query for query in manifest["queries"] if query["stage_id"] == "3_table"]
+        self.assertTrue(stage_three_queries)
+        self.assertTrue(all(not query["calibrated"] for query in stage_three_queries))
+
+    def test_multi_table_candidates_use_lightweight_predicate_groups(self) -> None:
+        snapshot = self._rich_snapshot()
+        config = GeneratorConfig(benchmark="toy", suffix="light_multi", max_join_tables=3, join_types=("inner",))
+
+        candidates = [candidate for candidate in build_multi_table_candidates(self.join_edges, self.catalog, snapshot, config) if candidate.stage_id == "3_table"]
+
+        self.assertTrue(candidates)
+        self.assertTrue(all(len(candidate.predicates) <= 2 for candidate in candidates))
+
     def test_job_like_template_pack_appends_candidates_and_preserves_left_joins(self) -> None:
         config = GeneratorConfig(
             benchmark="toy",
@@ -604,11 +647,11 @@ class QueryCurriculumSpjTest(unittest.TestCase):
             template_packs=(JOB_LIKE_TEMPLATE_PACK,),
         )
         snapshot = self._rich_snapshot()
-        available_pairs = apply_template_packs(
+        available_pairs = unique_candidates_by_signature(apply_template_packs(
             [JOB_LIKE_TEMPLATE_PACK],
             self._pair_candidates(snapshot, base_config),
             self._template_context(snapshot, base_config),
-        )
+        ))
         config = GeneratorConfig(
             benchmark="toy",
             suffix="joblike",

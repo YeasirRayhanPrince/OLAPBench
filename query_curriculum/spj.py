@@ -5,7 +5,7 @@ import random
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from math import ceil
 from numbers import Real
 from typing import Any
@@ -38,6 +38,7 @@ RANGE_QUANTILES = (0.15, 0.35, 0.50, 0.70, 0.85)
 MAX_RANGE_PREDICATES_PER_COLUMN = 6
 MIN_TOPOLOGY_RETAIN = 8
 PROBE_BATCH_MULTIPLIER = 2
+MAX_TOPOLOGIES = 64
 
 
 @dataclass(frozen=True)
@@ -125,9 +126,12 @@ class SpjCandidate:
     observed_selectivity: float | None = None
     filename: str | None = None
     query_id: str | None = None
+    _cached_signature: tuple[Any, ...] | None = field(default=None, init=False, repr=False, compare=False)
 
     def structural_signature(self) -> tuple[Any, ...]:
-        return (
+        if self._cached_signature is not None:
+            return self._cached_signature
+        sig = (
             self.stage_id,
             tuple(self.tables),
             self.base_table,
@@ -176,6 +180,11 @@ class SpjCandidate:
             ),
             tuple(self.projections),
         )
+        self._cached_signature = sig
+        return sig
+
+    def _invalidate_signature_cache(self) -> None:
+        self._cached_signature = None
 
     def signature(self) -> str:
         return repr(self.structural_signature())
@@ -666,20 +675,35 @@ def expand_predicate_groups(
         for table_name in table_names
     }
     groups: list[list[PredicateSpec]] = [[]]
+    lightweight_multi_table = len(table_names) >= 3
+
+    def preferred_pool(pool: list[PredicateSpec], *, limit: int) -> list[PredicateSpec]:
+        if not lightweight_multi_table:
+            return pool[:limit]
+        preferred = [
+            predicate
+            for predicate in pool
+            if bucket_for_selectivity(predicate.selectivity) in {"very_high", "high", "medium"}
+        ]
+        if preferred:
+            return preferred[:limit]
+        return pool[: min(1, len(pool))]
 
     for table_name in table_names:
-        pool = seed_pools[table_name]
+        pool = preferred_pool(seed_pools[table_name], limit=2 if lightweight_multi_table else len(seed_pools[table_name]))
         groups.extend([[predicate] for predicate in pool])
-        if max_predicates_per_query >= 2:
+        if not lightweight_multi_table and max_predicates_per_query >= 2:
             groups.extend([list(combo) for combo in itertools.combinations(pool[: min(4, len(pool))], 2)])
 
     if max_predicates_per_query >= 2:
         for left_table, right_table in itertools.combinations(table_names, 2):
-            for left in seed_pools[left_table][:3]:
-                for right in seed_pools[right_table][:3]:
+            left_pool = preferred_pool(seed_pools[left_table], limit=1 if lightweight_multi_table else 3)
+            right_pool = preferred_pool(seed_pools[right_table], limit=1 if lightweight_multi_table else 3)
+            for left in left_pool:
+                for right in right_pool:
                     groups.append([left, right])
 
-    if max_predicates_per_query >= 3:
+    if not lightweight_multi_table and max_predicates_per_query >= 3:
         limited_tables = table_names[: min(4, len(table_names))]
         for table_combo in itertools.combinations(limited_tables, 3):
             if all(seed_pools[table_name] for table_name in table_combo):
@@ -713,6 +737,36 @@ def topology_retain_limit(stage_budget: int, topology_count: int, snapshot: Stat
     if stage_budget <= 0 or topology_count <= 0:
         return 0
     return max(MIN_TOPOLOGY_RETAIN, ceil(stage_budget * probe_oversubscribe_factor(snapshot) / topology_count))
+
+
+def stage_pool_limit(stage_id: str, stage_budget: int, snapshot: StatsSnapshot) -> int:
+    if stage_budget <= 0:
+        return 0
+    if stage_id in {"1_table", "2_table"} and snapshot.mode == "stats_plus_selective_probes" and snapshot.provider is not None:
+        return max(stage_budget * 4, 32)
+    if stage_id == "1_table":
+        return max(stage_budget * 2, 24)
+    return max(stage_budget * 2, 24)
+
+
+def merge_candidate_pool(
+    current: list[SpjCandidate],
+    incoming: list[SpjCandidate],
+    *,
+    limit: int,
+    seed: int,
+) -> list[SpjCandidate]:
+    merged = unique_candidates_by_signature(current + incoming)
+    if limit <= 0 or len(merged) <= limit:
+        return merged
+    return retain_diverse_candidates(merged, limit=limit, seed=seed)
+
+
+def apply_template_packs_to_chunk(
+    candidates: list[SpjCandidate],
+    context: dict[str, Any],
+) -> list[SpjCandidate]:
+    return unique_candidates_by_signature(apply_template_packs(list(context["config"].template_packs), candidates, context))
 
 
 def _record_generation_stats(
@@ -1194,13 +1248,15 @@ def build_path_candidates(
         )
         seen_tables.add(right_table)
 
-    projections = cached_projection_options(ordered_tables, aliases, catalog, build_context)
+    all_projections = cached_projection_options(ordered_tables, aliases, catalog, build_context)
+    many_tables = len(ordered_tables) >= 4
+    projections = [(w, c) for w, c in all_projections if w in ("narrow", "medium")] if many_tables else all_projections
     predicate_groups = expand_predicate_groups(
         ordered_tables,
         aliases,
         catalog,
         snapshot,
-        per_table_seed_limit=4,
+        per_table_seed_limit=2 if many_tables else 4,
         max_predicates_per_query=min(3, max(1, config.max_predicates_per_table)),
         build_context=build_context,
     )
@@ -1241,15 +1297,25 @@ def build_path_candidates(
     return retained
 
 
-def enumerate_paths(join_edges: list[JoinEdge], length: int) -> list[list[JoinEdge]]:
+def enumerate_paths(join_edges: list[JoinEdge], length: int, *, max_topologies: int = MAX_TOPOLOGIES) -> list[list[JoinEdge]]:
     neighbors = undirected_neighbors(join_edges)
-    paths: list[list[JoinEdge]] = []
+    deduped: dict[tuple[str, ...], list[JoinEdge]] = {}
+    _early_stop = False
 
     def walk(current_table: str, remaining: int, path: list[JoinEdge], used_tables: set[str]) -> None:
+        nonlocal _early_stop
+        if _early_stop:
+            return
         if remaining == 0:
-            paths.append(list(path))
+            key = tuple(sorted(edge.key for edge in path))
+            if key not in deduped:
+                deduped[key] = list(path)
+                if max_topologies > 0 and len(deduped) >= max_topologies:
+                    _early_stop = True
             return
         for edge in sorted(neighbors[current_table], key=lambda item: item.key):
+            if _early_stop:
+                return
             next_table = edge.parent_table if edge.child_table == current_table else edge.child_table
             if next_table in used_tables:
                 continue
@@ -1260,29 +1326,29 @@ def enumerate_paths(join_edges: list[JoinEdge], length: int) -> list[list[JoinEd
             path.pop()
 
     for edge in join_edges:
+        if _early_stop:
+            break
         for start in [edge.child_table, edge.parent_table]:
+            if _early_stop:
+                break
             used_tables = {start}
             walk(start, length, [], used_tables)
 
-    deduped: dict[tuple[str, ...], list[JoinEdge]] = {}
-    for path in paths:
-        key = tuple(sorted(edge.key for edge in path))
-        deduped.setdefault(key, path)
     return list(deduped.values())
 
 
-def enumerate_star_edges(join_edges: list[JoinEdge], size: int) -> list[list[JoinEdge]]:
+def enumerate_star_edges(join_edges: list[JoinEdge], size: int, *, max_topologies: int = MAX_TOPOLOGIES) -> list[list[JoinEdge]]:
     neighbors = undirected_neighbors(join_edges)
-    stars: list[list[JoinEdge]] = []
+    deduped: dict[tuple[str, ...], list[JoinEdge]] = {}
     for table_name, edges in sorted(neighbors.items()):
         if len(edges) < size - 1:
             continue
         for combo in itertools.combinations(sorted(edges, key=lambda item: item.key), size - 1):
-            stars.append(list(combo))
-    deduped: dict[tuple[str, ...], list[JoinEdge]] = {}
-    for star in stars:
-        key = tuple(sorted(edge.key for edge in star))
-        deduped.setdefault(key, star)
+            key = tuple(sorted(edge.key for edge in combo))
+            if key not in deduped:
+                deduped[key] = list(combo)
+                if max_topologies > 0 and len(deduped) >= max_topologies:
+                    return list(deduped.values())
     return list(deduped.values())
 
 
@@ -1321,13 +1387,15 @@ def build_star_candidates(
             )
         )
         used.add(right_table)
-    projections = cached_projection_options(tables, aliases, catalog, build_context)
+    all_projections = cached_projection_options(tables, aliases, catalog, build_context)
+    many_tables = len(tables) >= 4
+    projections = [(w, c) for w, c in all_projections if w in ("narrow", "medium")] if many_tables else all_projections
     predicate_groups = expand_predicate_groups(
         tables,
         aliases,
         catalog,
         snapshot,
-        per_table_seed_limit=3,
+        per_table_seed_limit=2 if many_tables else 3,
         max_predicates_per_query=min(3, max(1, config.max_predicates_per_table)),
         build_context=build_context,
     )
@@ -1432,6 +1500,112 @@ def build_multi_table_candidates(
     return unique_candidates_by_signature(candidates)
 
 
+def build_stage_two_candidates(
+    join_edges: list[JoinEdge],
+    catalog: dict[str, TableSchema],
+    snapshot: StatsSnapshot,
+    config: GeneratorConfig,
+    build_context: SpjBuildContext,
+) -> list[SpjCandidate]:
+    stage_id = "2_table"
+    stage_budget = config.stage_budgets.get(stage_id, 0)
+    if stage_budget <= 0:
+        return []
+    topology_count = len(join_edges) * len(config.join_types)
+    per_topology_limit = topology_retain_limit(stage_budget, topology_count, snapshot)
+    reservoir_limit = stage_pool_limit(stage_id, stage_budget, snapshot)
+    context = {"catalog": catalog, "join_edges": join_edges, "config": config, "snapshot": snapshot}
+    all_chunks: list[SpjCandidate] = []
+    for edge_index, edge in enumerate(join_edges):
+        chunk = build_pair_candidates_for_edge(
+            edge,
+            catalog,
+            snapshot,
+            config,
+            build_context=build_context,
+            retain_limit=per_topology_limit,
+            seed_offset=20000 + edge_index,
+        )
+        chunk = apply_template_packs_to_chunk(chunk, context)
+        all_chunks.extend(chunk)
+    stage_pool = unique_candidates_by_signature(all_chunks)
+    if reservoir_limit > 0 and len(stage_pool) > reservoir_limit:
+        stage_pool = retain_diverse_candidates(stage_pool, limit=reservoir_limit, seed=config.seed + 30000)
+    build_context.diagnostics[stage_id]["retained_before_probe"] = len(stage_pool)
+    return stage_pool
+
+
+def build_stage_multi_table_candidates(
+    table_count: int,
+    join_edges: list[JoinEdge],
+    catalog: dict[str, TableSchema],
+    snapshot: StatsSnapshot,
+    config: GeneratorConfig,
+    build_context: SpjBuildContext,
+) -> list[SpjCandidate]:
+    stage_id = stage_key(table_count)
+    stage_budget = config.stage_budgets.get(stage_id, 0)
+    if stage_budget <= 0:
+        return []
+
+    path_edges_list = build_context.paths_by_length.setdefault(table_count - 1, enumerate_paths(join_edges, table_count - 1))
+    star_edges_list = build_context.stars_by_size.setdefault(table_count, enumerate_star_edges(join_edges, table_count))
+    topology_count = len(path_edges_list) + len(star_edges_list)
+    if "left" in config.join_types and table_count == 3:
+        topology_count += len(path_edges_list)
+
+    per_topology_limit = topology_retain_limit(stage_budget, topology_count, snapshot)
+    reservoir_limit = stage_pool_limit(stage_id, stage_budget, snapshot)
+    context = {"catalog": catalog, "join_edges": join_edges, "config": config, "snapshot": snapshot}
+    all_chunks: list[SpjCandidate] = []
+
+    for index, path_edges in enumerate(path_edges_list):
+        inner_chunk = build_path_candidates(
+            path_edges,
+            catalog,
+            snapshot,
+            "inner",
+            config,
+            build_context=build_context,
+            retain_limit=per_topology_limit,
+            seed_offset=(table_count * 1000) + index,
+        )
+        inner_chunk = apply_template_packs_to_chunk(inner_chunk, context)
+        all_chunks.extend(inner_chunk)
+        if "left" in config.join_types and table_count == 3:
+            left_chunk = build_path_candidates(
+                path_edges,
+                catalog,
+                snapshot,
+                "left",
+                config,
+                build_context=build_context,
+                retain_limit=per_topology_limit,
+                seed_offset=(table_count * 2000) + index,
+            )
+            left_chunk = apply_template_packs_to_chunk(left_chunk, context)
+            all_chunks.extend(left_chunk)
+
+    for index, star_edges in enumerate(star_edges_list):
+        star_chunk = build_star_candidates(
+            star_edges,
+            catalog,
+            snapshot,
+            config,
+            build_context=build_context,
+            retain_limit=per_topology_limit,
+            seed_offset=(table_count * 3000) + index,
+        )
+        star_chunk = apply_template_packs_to_chunk(star_chunk, context)
+        all_chunks.extend(star_chunk)
+
+    stage_pool = unique_candidates_by_signature(all_chunks)
+    if reservoir_limit > 0 and len(stage_pool) > reservoir_limit:
+        stage_pool = retain_diverse_candidates(stage_pool, limit=reservoir_limit, seed=config.seed + (table_count * 5000))
+    build_context.diagnostics[stage_id]["retained_before_probe"] = len(stage_pool)
+    return stage_pool
+
+
 def ordered_candidates(candidates: list[SpjCandidate], seed: int) -> list[SpjCandidate]:
     if not candidates:
         return []
@@ -1485,12 +1659,18 @@ def select_candidates_for_stage(
     seed: int,
     snapshot: StatsSnapshot,
     *,
+    stage_id: str,
     probe_workers: int,
 ) -> tuple[list[SpjCandidate], dict[str, int]]:
     ordered = ordered_candidates(candidates, seed)
     diagnostics = _diagnostic_bucket()
     diagnostics["retained_before_probe"] = len(ordered)
-    if snapshot.mode != "stats_plus_selective_probes" or snapshot.provider is None:
+    should_probe = (
+        snapshot.mode == "stats_plus_selective_probes"
+        and snapshot.provider is not None
+        and stage_id in {"1_table", "2_table"}
+    )
+    if not should_probe:
         selected: list[SpjCandidate] = []
         seen_sql: set[str] = set()
         for candidate in ordered:
@@ -1545,14 +1725,18 @@ def select_candidates_for_stage(
 
     selected: list[SpjCandidate] = []
     seen_sql: set[str] = set()
-    batch_size = max(workers, min(len(ordered), max(budget * PROBE_BATCH_MULTIPLIER, workers)))
+    batch_size = max(workers, min(len(ordered), budget * 4))
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for offset in range(0, len(ordered), batch_size):
                 batch = ordered[offset : offset + batch_size]
-                probed_batch = list(executor.map(worker, batch))
-                diagnostics["probed"] += len(probed_batch)
-                for candidate in probed_batch:
+                futures = [executor.submit(worker, candidate) for candidate in batch]
+                for future in futures:
+                    if len(selected) >= budget:
+                        future.cancel()
+                        continue
+                    candidate = future.result()
+                    diagnostics["probed"] += 1
                     if candidate.observed_rows == 0:
                         continue
                     sql_signature = normalize_sql(candidate.render_sql())
@@ -1560,8 +1744,6 @@ def select_candidates_for_stage(
                         continue
                     seen_sql.add(sql_signature)
                     selected.append(candidate)
-                    if len(selected) >= budget:
-                        break
                 if len(selected) >= budget:
                     break
     finally:
@@ -1614,44 +1796,24 @@ def generate_spj_workload(
     snapshot: StatsSnapshot,
 ) -> tuple[dict[str, Any], list[QueryArtifact]]:
     build_context = make_build_context(catalog, snapshot, config)
-    stage_candidates: dict[str, list[SpjCandidate]] = {}
-
-    stage_one = build_stage_one_candidates(catalog, snapshot, config, build_context=build_context)
-    build_context.diagnostics["1_table"]["generated_before_prune"] = len(stage_one)
-    build_context.diagnostics["1_table"]["retained_before_probe"] = len(stage_one)
-    stage_candidates["1_table"] = stage_one
-
-    stage_two_budget = config.stage_budgets.get("2_table", 0)
-    stage_two_topologies = len(join_edges) * len(config.join_types)
-    stage_two_retain_limit = topology_retain_limit(stage_two_budget, stage_two_topologies, snapshot)
-    stage_candidates["2_table"] = [
-        candidate
-        for edge_index, edge in enumerate(join_edges)
-        for candidate in build_pair_candidates_for_edge(
-            edge,
-            catalog,
-            snapshot,
-            config,
-            build_context=build_context,
-            retain_limit=stage_two_retain_limit,
-            seed_offset=20000 + edge_index,
-        )
-    ]
-    for candidate in build_multi_table_candidates(join_edges, catalog, snapshot, config, build_context=build_context):
-        stage_candidates.setdefault(candidate.stage_id, []).append(candidate)
-
-    context = {"catalog": catalog, "join_edges": join_edges, "config": config, "snapshot": snapshot}
-    for stage_id, candidates in list(stage_candidates.items()):
-        stage_candidates[stage_id] = unique_candidates_by_signature(
-            apply_template_packs(list(config.template_packs), candidates, context)
-        )
-        build_context.diagnostics[stage_id]["retained_before_probe"] = len(stage_candidates[stage_id])
-
     selected: list[SpjCandidate] = []
     for table_count in range(1, config.max_join_tables + 1):
         current_stage = stage_key(table_count)
         budget = config.stage_budgets.get(current_stage, 0)
-        available = stage_candidates.get(current_stage, [])
+        if budget <= 0:
+            continue
+        if table_count == 1:
+            context = {"catalog": catalog, "join_edges": join_edges, "config": config, "snapshot": snapshot}
+            available = apply_template_packs_to_chunk(
+                build_stage_one_candidates(catalog, snapshot, config, build_context=build_context),
+                context,
+            )
+            build_context.diagnostics[current_stage]["generated_before_prune"] = len(available)
+            build_context.diagnostics[current_stage]["retained_before_probe"] = len(available)
+        elif table_count == 2:
+            available = build_stage_two_candidates(join_edges, catalog, snapshot, config, build_context)
+        else:
+            available = build_stage_multi_table_candidates(table_count, join_edges, catalog, snapshot, config, build_context)
         if budget > len(available):
             raise ValueError(
                 f"Stage {current_stage} requested {budget} queries but only {len(available)} unique candidates were generated "
@@ -1662,6 +1824,7 @@ def generate_spj_workload(
             budget,
             config.seed + table_count,
             snapshot,
+            stage_id=current_stage,
             probe_workers=config.probe_workers,
         )
         build_context.diagnostics[current_stage]["probed"] = probe_diagnostics["probed"]

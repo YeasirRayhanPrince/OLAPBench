@@ -104,7 +104,36 @@ def _render_scalar_token(expr: dict[str, Any]) -> str:
     return "[UNKNOWN]"
 
 
-def _render_expression_lines(expr: dict[str, Any], indent: str) -> list[str]:
+def _extract_pred_info(
+    expr: dict[str, Any], table_ids: dict[str, int],
+) -> tuple[list[int], set[int]]:
+    """Recursively extract global column IDs and table IDs from an expression."""
+    global_ids: list[int] = []
+    tables: set[int] = set()
+    if "global_ids" in expr and expr["global_ids"]:
+        for gid_entry in expr["global_ids"]:
+            global_ids.append(gid_entry["global_id"])
+            tbl = gid_entry.get("table")
+            if tbl and tbl in table_ids:
+                tables.add(table_ids[tbl])
+    for operand in expr.get("operands", []):
+        child_gids, child_tbls = _extract_pred_info(operand, table_ids)
+        global_ids.extend(child_gids)
+        tables.update(child_tbls)
+    return global_ids, tables
+
+
+_SUBQUERY_KINDS = {"EXISTS", "IN", "SCALAR_QUERY", "ARRAY_QUERY",
+                   "MULTISET_QUERY", "MAP_QUERY", "SOME", "ALL"}
+
+
+def _render_expression_lines(
+    expr: dict[str, Any], indent: str, table_ids: dict[str, int],
+    _counter: list[int] | None = None,
+    pred_counter: list[int] | None = None,
+    pred_registry: list[dict] | None = None,
+    _label_pred: bool = False,
+) -> list[str]:
     if "op" not in expr:
         return [f"{indent}{_render_scalar_token(expr)}"]
 
@@ -114,29 +143,70 @@ def _render_expression_lines(expr: dict[str, Any], indent: str) -> list[str]:
     if kind in {"AND", "OR"}:
         lines = [f"{indent}[{kind}]"]
         for operand in operands:
-            lines.extend(_render_expression_lines(operand, indent + "  "))
+            lines.extend(_render_expression_lines(
+                operand, indent + "  ", table_ids, _counter,
+                pred_counter, pred_registry, _label_pred,
+            ))
         return lines
 
+    # Helper: assign [P_n] when labelling is active and expression has column refs.
+    def _maybe_pred_tag(ex: dict[str, Any]) -> str:
+        if not (_label_pred and pred_counter is not None and pred_registry is not None):
+            return ""
+        global_ids, tables = _extract_pred_info(ex, table_ids)
+        if not global_ids:
+            return ""
+        p_id = pred_counter[0]
+        pred_counter[0] += 1
+        pred_registry.append({"pred_id": p_id, "global_ids": global_ids, "tables": sorted(tables)})
+        return f"[P_{p_id}] "
+
     if kind == "NOT":
-        child_lines = _render_expression_lines(operands[0], "")
+        p_tag = _maybe_pred_tag(expr)
+        # Child does NOT get its own P_n — the NOT wrapper claims it.
+        child_lines = _render_expression_lines(
+            operands[0], "", table_ids, _counter,
+            pred_counter, pred_registry, False,
+        )
         if len(child_lines) == 1:
-            return [f"{indent}[NOT] {child_lines[0].lstrip().rstrip()} "]
-        lines = [f"{indent}[NOT]"]
+            return [f"{indent}{p_tag}[NOT] {child_lines[0].lstrip().rstrip()} "]
+        lines = [f"{indent}{p_tag}[NOT]"]
         for child_line in child_lines:
             lines.append(f"{indent}  {child_line.lstrip()}")
         return lines
 
     if kind in {"IS_NULL", "IS_NOT_NULL"} and operands:
-        return [f"{indent}[{kind}] {_render_scalar_token(operands[0])} "]
+        p_tag = _maybe_pred_tag(expr)
+        return [f"{indent}{p_tag}[{kind}] {_render_scalar_token(operands[0])} "]
+
+    if kind in _SUBQUERY_KINDS:
+        scalar_parts = [_render_scalar_token(op) for op in operands]
+        suffix = (" " + " ".join(scalar_parts)) if scalar_parts else ""
+        lines = [f"{indent}[{kind}]{suffix}"]
+        nested_rel = expr.get("rel")
+        if isinstance(nested_rel, dict):
+            nested_rels = nested_rel.get("rels", [])
+            if nested_rels:
+                lines.append(f"{indent}  [SUBQUERY]")
+                lines.extend(_build_rels_token_lines(
+                    nested_rels, table_ids, indent=indent + "    ", _counter=_counter,
+                    pred_counter=pred_counter, pred_registry=pred_registry,
+                ))
+                lines.append(f"{indent}  [/SUBQUERY]")
+        return lines
 
     if len(operands) == 2:
+        p_tag = _maybe_pred_tag(expr)
         left = _render_scalar_token(operands[0])
         right = _render_scalar_token(operands[1])
-        return [f"{indent}[{kind}] {left} {right} "]
+        return [f"{indent}{p_tag}[{kind}] {left} {right} "]
 
     lines = [f"{indent}[{kind}]"]
     for operand in operands:
-        lines.extend(_render_expression_lines(operand, indent + "  "))
+        lines.extend(_render_expression_lines(
+            operand, indent + "  ", table_ids, _counter,
+            pred_counter, pred_registry, _label_pred,
+        ))
     return lines
 
 
@@ -166,54 +236,88 @@ def _rel_inputs(rel: dict[str, Any], ptr_ids: dict[str, int], default_ptr: int |
     return " ".join(f"[PTR_{ptr_ids[str(input_id)]}]" for input_id in inputs)
 
 
-def _build_logical_token(plan_json: dict[str, Any], table_ids: dict[str, int]) -> str:
-    rels = plan_json.get("rels", [])
-    ptr_ids = {str(rel.get("id")): index for index, rel in enumerate(rels)}
-    token_lines = ["[LOGICAL_PLAN]"]
+def _build_rels_token_lines(
+    rels: list[dict[str, Any]], table_ids: dict[str, int], indent: str = "  ",
+    _counter: list[int] | None = None,
+    pred_counter: list[int] | None = None,
+    pred_registry: list[dict] | None = None,
+) -> list[str]:
+    if _counter is None:
+        _counter = [0]
+    ptr_ids: dict[str, int] = {}
+    for rel in rels:
+        ptr_ids[str(rel.get("id"))] = _counter[0]
+        _counter[0] += 1
+    token_lines: list[str] = []
+    cond_indent = indent + "  "
 
     for ptr_index, rel in enumerate(rels):
         operator = rel.get("relOp", "UNKNOWN")
-        token_lines.append(f"  [PTR_{ptr_index}] [{operator}]" + (
-            f" [T{table_ids.get(rel.get('table', ['',''])[-1], -1)}]"
+        ptr_val = ptr_ids[str(rel.get("id"))]
+        token_lines.append(f"{indent}[PTR_{ptr_val}] [{operator}]" + (
+            f" [T{table_ids.get(rel.get('table', ['', ''])[-1], -1)}]"
             if operator == "LogicalTableScan"
             else (f" [{str(rel.get('joinType', '')).upper()}]" if operator == "LogicalJoin" else "")
         ))
 
         if operator == "LogicalJoin":
-            condition_lines = _render_expression_lines(rel.get("condition", {}), "    ")
+            condition_lines = _render_expression_lines(
+                rel.get("condition", {}), cond_indent, table_ids, _counter,
+                pred_counter, pred_registry, _label_pred=True,
+            )
             if condition_lines:
                 condition_lines[-1] = condition_lines[-1].rstrip()
                 head = condition_lines[0].lstrip()
-                token_lines.append(f"    [CONDITION] {head}")
+                token_lines.append(f"{cond_indent}[CONDITION] {head}")
                 token_lines.extend(condition_lines[1:])
             input_tokens = _rel_inputs(rel, ptr_ids)
-            token_lines.append(f"    [INPUT] {input_tokens}")
+            token_lines.append(f"{cond_indent}[INPUT] {input_tokens}")
             continue
 
         if operator == "LogicalFilter":
-            condition_lines = _render_expression_lines(rel.get("condition", {}), "    ")
+            condition_lines = _render_expression_lines(
+                rel.get("condition", {}), cond_indent, table_ids, _counter,
+                pred_counter, pred_registry, _label_pred=True,
+            )
             if condition_lines:
                 condition_lines[-1] = condition_lines[-1].rstrip()
                 head = condition_lines[0].lstrip()
-                token_lines.append(f"    [CONDITION] {head}")
+                token_lines.append(f"{cond_indent}[CONDITION] {head}")
                 token_lines.extend(condition_lines[1:])
-            input_tokens = _rel_inputs(rel, ptr_ids, ptr_index - 1)
-            token_lines.append(f"    [INPUT] {input_tokens}")
+            default_ptr = rels[ptr_index - 1].get("id") if ptr_index > 0 else None
+            input_tokens = _rel_inputs(rel, ptr_ids, default_ptr)
+            token_lines.append(f"{cond_indent}[INPUT] {input_tokens}")
             continue
 
         if operator == "LogicalProject":
-            token_lines.append(f"    [COL] {_render_project_cols(rel)}")
-            input_tokens = _rel_inputs(rel, ptr_ids, ptr_index - 1)
-            token_lines.append(f"    [INPUT] {input_tokens}")
+            token_lines.append(f"{cond_indent}[COL] {_render_project_cols(rel)}")
+            default_ptr = rels[ptr_index - 1].get("id") if ptr_index > 0 else None
+            input_tokens = _rel_inputs(rel, ptr_ids, default_ptr)
+            token_lines.append(f"{cond_indent}[INPUT] {input_tokens}")
             continue
 
         if operator == "LogicalAggregate":
-            token_lines.extend(_render_aggregate_lines(rel, "    "))
-            input_tokens = _rel_inputs(rel, ptr_ids, ptr_index - 1)
-            token_lines.append(f"    [INPUT] {input_tokens}")
+            token_lines.extend(_render_aggregate_lines(rel, cond_indent))
+            default_ptr = rels[ptr_index - 1].get("id") if ptr_index > 0 else None
+            input_tokens = _rel_inputs(rel, ptr_ids, default_ptr)
+            token_lines.append(f"{cond_indent}[INPUT] {input_tokens}")
 
-    token_lines.append("[/LOGICAL_PLAN]")
-    return "\n".join(token_lines)
+    return token_lines
+
+
+def _build_logical_token(plan_json: dict[str, Any], table_ids: dict[str, int]) -> tuple[str, list[dict]]:
+    """Return ``(logical_token_string, pred_registry)``."""
+    rels = plan_json.get("rels", [])
+    counter = [0]
+    pred_counter = [0]
+    pred_registry: list[dict] = []
+    lines = ["[LOGICAL_PLAN]"]
+    lines.extend(_build_rels_token_lines(
+        rels, table_ids, _counter=counter,
+        pred_counter=pred_counter, pred_registry=pred_registry,
+    ))
+    lines.append("[/LOGICAL_PLAN]")
+    return "\n".join(lines), pred_registry
 
 
 def build_calcite_training_records(
@@ -255,12 +359,15 @@ def build_calcite_training_records(
             continue
         plan = generator.load_plan(str(work_dir_obj / query_stem))
 
+        logical_ir, pred_registry = _build_logical_token(plan.json_plan, table_ids)
+
         row = {
             "schema": schema_name,
             "query_key": query_key,
             "query_sql": query_path.read_text(),
             "calcite_plan": plan.text_plan,
-            "logical_tokenized_plan": _build_logical_token(plan.json_plan, table_ids),
+            "logical_tokenized_plan": logical_ir,
+            "pred_registry": pred_registry,
             "plan_json_path": str(work_dir_obj / f"{query_stem}.plan.json"),
             "plan_text_path": str(work_dir_obj / f"{query_stem}.plan.txt"),
             "global_mapping_path": str(work_dir_obj / f"{query_stem}.global-mapping.json"),

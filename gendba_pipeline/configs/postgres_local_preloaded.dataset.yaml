@@ -33,7 +33,7 @@ systems:
       database: postgres
 benchmarks:
   - name: gendba-pool
-    query_dir: exhaustive
+    # query_dir: exhaustive
 export:
   training_jsonl_name: gendba_pool.training.jsonl
   manifest_jsonl_name: gendba_pool.manifest.jsonl
