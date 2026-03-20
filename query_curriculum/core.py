@@ -138,6 +138,7 @@ class GeneratorConfig:
     max_predicates_per_table: int = 3
     probe_workers: int = 4
     stats_mode: str = "auto"
+    llm_seed_model: str = "gpt-4o-mini"
     pg: PgConnectionConfig | None = None
     template_packs: tuple[str, ...] = ()
 
@@ -428,7 +429,7 @@ class PostgresStatsProvider:
 
 def load_stats_snapshot(config: GeneratorConfig, catalog: dict[str, TableSchema]) -> StatsSnapshot:
     mode = resolve_stats_mode(config)
-    if mode == "schema_only":
+    if mode in ("schema_only", "schema_plus_llm"):
         return StatsSnapshot(mode=mode)
     if config.pg is None or not config.pg.enabled:
         if mode == "stats_only":

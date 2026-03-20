@@ -36,13 +36,24 @@ MAX_JOIN_TABLES="12"
 MAX_PREDICATES_PER_TABLE="5"
 PROBE_WORKERS="32"
 JOIN_TYPES=("inner" "left")
-# Valid values: auto, schema_only, stats_only, stats_plus_selective_probes, stats_plus_estimated_probes
+# Valid values: auto, schema_only, schema_plus_llm, stats_only, stats_plus_selective_probes, stats_plus_estimated_probes
 #   auto                          — uses stats_plus_selective_probes if PG connected, else schema_only
 #   schema_only                   — schema metadata only (no PG needed, less realistic predicates)
+#   schema_plus_llm               — schema + LLM-generated predicate seeds (no PG needed, requires OPENAI_API_KEY)
 #   stats_only                    — real column stats from pg_stats (requires PG, no live probes)
 #   stats_plus_selective_probes   — stats + live COUNT(*) probes to verify selectivity (requires PG, slow on large datasets)
 #   stats_plus_estimated_probes   — stats + EXPLAIN-based estimated row counts (requires PG, fast)
-STATS_MODE="stats_plus_estimated_probes"
+STATS_MODE="schema_only"
+# OpenAI model for LLM seed generation (only used when STATS_MODE=schema_plus_llm)
+# Options (cheapest → best):
+#   gpt-4o-mini   — fast & cheapest, good enough for seed generation (default)
+#   gpt-4.1-nano  — newer, very cheap, similar to 4o-mini
+#   gpt-4.1-mini  — better JSON adherence, slightly pricier
+#   gpt-4o        — more creative/diverse values, ~10x cost of 4o-mini
+#   gpt-4.1       — best quality, overkill for seeds, ~10x cost of 4.1-mini
+LLM_SEED_MODEL="gpt-5"
+# OpenAI API key (required when STATS_MODE=schema_plus_llm)
+OPENAI_API_KEY=""
 
 # ── SPJ-specific: template packs & stage budgets ───────────────────────────
 # Template packs are only used for --branch spj (ignored by other branches).
@@ -51,9 +62,9 @@ TEMPLATE_PACKS=("job_like_implicit_joins")
 # Stage budgets control how many queries are generated per join-width stage.
 # These are SPJ-specific; other branches use their own internal defaults.
 STAGE_1_QUERIES="50"
-STAGE_2_QUERIES="50"
+STAGE_2_QUERIES="100"
 STAGE_3_QUERIES="100"
-STAGE_4_QUERIES="200"
+STAGE_4_QUERIES="100"
 
 # ── Plan collection (requires PG) ──────────────────────────────────────────
 # Set to true to append --collect-plans (collects EXPLAIN plans via PG).
@@ -82,6 +93,7 @@ CMD=(
     --probe-workers "${PROBE_WORKERS}"
     --join-types "${JOIN_TYPES[@]}"
     --stats-mode "${STATS_MODE}"
+    --llm-seed-model "${LLM_SEED_MODEL}"
     --pg-enabled
     --pg-host "${PGHOST_VALUE}"
     --pg-port "${PGPORT_VALUE}"
@@ -119,6 +131,10 @@ fi
 cd "${REPO_ROOT}"
 source "${VENV_ACTIVATE}"
 echo "Activated virtual environment: ${VENV_ACTIVATE}"
+
+if [[ -n "${OPENAI_API_KEY}" ]]; then
+    export OPENAI_API_KEY
+fi
 
 OUTPUT_DIR="${REPO_ROOT}/benchmarks/${BENCHMARK}/queries_${SUFFIX}"
 if [[ -d "${OUTPUT_DIR}" ]]; then

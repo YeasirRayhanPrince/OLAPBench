@@ -86,6 +86,7 @@ def build_config(args: argparse.Namespace) -> GeneratorConfig:
         max_predicates_per_table=args.max_predicates_per_table if args.max_predicates_per_table is not None else int(config_data.get("max_predicates_per_table", 3)),
         probe_workers=args.probe_workers if args.probe_workers is not None else int(config_data.get("probe_workers", 4)),
         stats_mode=args.stats_mode or config_data.get("stats_mode", "auto"),
+        llm_seed_model=args.llm_seed_model or config_data.get("llm_seed_model", "gpt-4o-mini"),
         pg=pg if pg.enabled else None,
         template_packs=tuple(args.template_pack or config_data.get("template_packs", [])),
     )
@@ -195,7 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--stage-budget", action="append", default=None, help="Override stage budget, e.g. 2_table=12")
     generate.add_argument("--max-predicates-per-table", type=int, default=None)
     generate.add_argument("--probe-workers", type=int, default=None)
-    generate.add_argument("--stats-mode", choices=["auto", "schema_only", "stats_only", "stats_plus_selective_probes", "stats_plus_estimated_probes"], default=None)
+    generate.add_argument("--stats-mode", choices=["auto", "schema_only", "schema_plus_llm", "stats_only", "stats_plus_selective_probes", "stats_plus_estimated_probes"], default=None)
+    generate.add_argument("--llm-seed-model", type=str, default=None, help="OpenAI model for LLM seed generation (default: gpt-4o-mini)")
     generate.add_argument("--pg-enabled", action="store_true")
     generate.add_argument("--pg-host", type=str, default=None)
     generate.add_argument("--pg-port", type=int, default=None)

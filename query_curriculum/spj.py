@@ -127,6 +127,7 @@ class SpjCandidate:
     filename: str | None = None
     query_id: str | None = None
     _cached_signature: tuple[Any, ...] | None = field(default=None, init=False, repr=False, compare=False)
+    _cached_sql: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def structural_signature(self) -> tuple[Any, ...]:
         if self._cached_signature is not None:
@@ -185,26 +186,32 @@ class SpjCandidate:
 
     def _invalidate_signature_cache(self) -> None:
         self._cached_signature = None
+        self._cached_sql = None
 
     def signature(self) -> str:
         return repr(self.structural_signature())
 
     def render_sql(self) -> str:
+        if self._cached_sql is not None:
+            return self._cached_sql
         if self.render_mode == "job_like":
-            return render_job_like_sql(self)
-        projection_sql = ", ".join(f"{alias}.{column}" for _, alias, column in self.projections) or "*"
-        lines = [f"SELECT {projection_sql}", f"FROM {self.base_table} AS {self.aliases()[self.base_table]}"]
-        for join in self.joins:
-            on_parts = [f"{join.left_alias}.{join.left_column} = {join.right_alias}.{join.right_column}"]
-            for predicate in join.on_predicates:
-                on_parts.append(render_predicate(predicate))
-            lines.append(f"{join.join_type.upper()} JOIN {join.right_table} AS {join.right_alias}")
-            lines.append("  ON " + "\n  AND ".join(on_parts))
-        where_predicates = [render_predicate(predicate) for predicate in self.predicates if predicate.placement == "where"]
-        if where_predicates:
-            lines.append("WHERE " + "\n  AND ".join(where_predicates))
-        lines.append(";")
-        return "\n".join(lines) + "\n"
+            sql = render_job_like_sql(self)
+        else:
+            projection_sql = ", ".join(f"{alias}.{column}" for _, alias, column in self.projections) or "*"
+            lines = [f"SELECT {projection_sql}", f"FROM {self.base_table} AS {self.aliases()[self.base_table]}"]
+            for join in self.joins:
+                on_parts = [f"{join.left_alias}.{join.left_column} = {join.right_alias}.{join.right_column}"]
+                for predicate in join.on_predicates:
+                    on_parts.append(render_predicate(predicate))
+                lines.append(f"{join.join_type.upper()} JOIN {join.right_table} AS {join.right_alias}")
+                lines.append("  ON " + "\n  AND ".join(on_parts))
+            where_predicates = [render_predicate(predicate) for predicate in self.predicates if predicate.placement == "where"]
+            if where_predicates:
+                lines.append("WHERE " + "\n  AND ".join(where_predicates))
+            lines.append(";")
+            sql = "\n".join(lines) + "\n"
+        self._cached_sql = sql
+        return sql
 
     def aliases(self) -> dict[str, str]:
         aliases = {self.base_table: self.projections[0][1]} if self.projections else {}
@@ -542,6 +549,10 @@ def predicate_selection_score(predicate: PredicateSpec) -> float:
 def build_seed_templates(
     table: TableSchema,
     column_stats: dict[str, ColumnStats],
+    *,
+    llm_fallback: bool = False,
+    benchmark: str = "job",
+    llm_seed_model: str = "gpt-4o-mini",
 ) -> list[SeedTemplate]:
     predicates: list[SeedTemplate] = []
     for column in sorted(table.columns.values(), key=lambda item: (item.role, item.name)):
@@ -549,6 +560,9 @@ def build_seed_templates(
         predicates.extend(_build_null_predicates(table, column, stats))
         predicates.extend(_build_mcv_predicates(table, column, stats))
         predicates.extend(_build_range_predicates(table, column, stats))
+    if not predicates and llm_fallback:
+        from query_curriculum.llm_seeds import build_llm_seed_templates
+        predicates = build_llm_seed_templates(table, benchmark=benchmark, model=llm_seed_model)
     deduped: dict[tuple[str, str, str, str], SeedTemplate] = {}
     for predicate in predicates:
         key = (predicate.column, predicate.operator, repr(predicate.value), predicate.family)
@@ -560,8 +574,14 @@ def build_predicate_seeds(
     table: TableSchema,
     alias: str,
     column_stats: dict[str, ColumnStats],
+    *,
+    llm_fallback: bool = False,
+    benchmark: str = "job",
+    llm_seed_model: str = "gpt-4o-mini",
 ) -> list[PredicateSpec]:
-    return [bind_seed_template(seed, alias) for seed in build_seed_templates(table, column_stats)]
+    return [bind_seed_template(seed, alias) for seed in build_seed_templates(
+        table, column_stats, llm_fallback=llm_fallback, benchmark=benchmark, llm_seed_model=llm_seed_model,
+    )]
 
 
 def top_seed_pool(
@@ -571,7 +591,11 @@ def top_seed_pool(
     *,
     limit: int = 6,
     build_context: SpjBuildContext | None = None,
+    llm_fallback: bool = False,
+    benchmark: str = "job",
+    llm_seed_model: str = "gpt-4o-mini",
 ) -> list[PredicateSpec]:
+    llm_kw = dict(llm_fallback=llm_fallback, benchmark=benchmark, llm_seed_model=llm_seed_model)
     if build_context is not None:
         cache_key = (table.name, limit)
         if cache_key not in build_context.top_seed_templates_by_table_limit:
@@ -579,12 +603,12 @@ def top_seed_pool(
                 table,
                 build_context.seed_templates_by_table.setdefault(
                     table.name,
-                    build_seed_templates(table, snapshot.column_stats.get(table.name, {})),
+                    build_seed_templates(table, snapshot.column_stats.get(table.name, {}), **llm_kw),
                 ),
                 limit=limit,
             )
         return [bind_seed_template(seed, alias) for seed in build_context.top_seed_templates_by_table_limit[cache_key]]
-    seeds = build_seed_templates(table, snapshot.column_stats.get(table.name, {}))
+    seeds = build_seed_templates(table, snapshot.column_stats.get(table.name, {}), **llm_kw)
     return [bind_seed_template(seed, alias) for seed in _top_seed_templates(table, seeds, limit=limit)]
 
 
@@ -663,7 +687,15 @@ def expand_predicate_groups(
     per_table_seed_limit: int,
     max_predicates_per_query: int,
     build_context: SpjBuildContext | None = None,
+    config: GeneratorConfig | None = None,
 ) -> list[list[PredicateSpec]]:
+    llm_kw: dict = {}
+    if config is not None:
+        llm_kw = dict(
+            llm_fallback=snapshot.mode == "schema_plus_llm",
+            benchmark=config.benchmark,
+            llm_seed_model=config.llm_seed_model,
+        )
     seed_pools = {
         table_name: top_seed_pool(
             catalog[table_name],
@@ -671,6 +703,7 @@ def expand_predicate_groups(
             snapshot,
             limit=per_table_seed_limit,
             build_context=build_context,
+            **llm_kw,
         )
         for table_name in table_names
     }
@@ -986,14 +1019,19 @@ def build_stage_one_candidates(
         table = catalog[table_name]
         aliases = alias_map([table_name])
         alias = aliases[table_name]
+        llm_kw = dict(
+            llm_fallback=snapshot.mode == "schema_plus_llm",
+            benchmark=config.benchmark,
+            llm_seed_model=config.llm_seed_model,
+        )
         if build_context is not None:
             seed_templates = build_context.seed_templates_by_table.setdefault(
                 table_name,
-                build_seed_templates(table, snapshot.column_stats.get(table_name, {})),
+                build_seed_templates(table, snapshot.column_stats.get(table_name, {}), **llm_kw),
             )
             seeds = [bind_seed_template(seed, alias) for seed in seed_templates]
         else:
-            seeds = build_predicate_seeds(table, alias, snapshot.column_stats.get(table_name, {}))
+            seeds = build_predicate_seeds(table, alias, snapshot.column_stats.get(table_name, {}), **llm_kw)
         projections = cached_projection_options([table_name], aliases, catalog, build_context)
         for predicate_group in predicate_combinations(seeds, config.max_predicates_per_table):
             estimated = average_selectivity(predicate_group)
@@ -1036,8 +1074,13 @@ def build_pair_candidates_for_edge(
     child = catalog[edge.child_table]
     parent = catalog[edge.parent_table]
     child_alias, parent_alias = alias_map([child.name, parent.name]).values()
-    child_seeds = top_seed_pool(child, child_alias, snapshot, limit=6, build_context=build_context)
-    parent_seeds = top_seed_pool(parent, parent_alias, snapshot, limit=6, build_context=build_context)
+    llm_kw = dict(
+        llm_fallback=snapshot.mode == "schema_plus_llm",
+        benchmark=config.benchmark,
+        llm_seed_model=config.llm_seed_model,
+    )
+    child_seeds = top_seed_pool(child, child_alias, snapshot, limit=6, build_context=build_context, **llm_kw)
+    parent_seeds = top_seed_pool(parent, parent_alias, snapshot, limit=6, build_context=build_context, **llm_kw)
     projections = cached_projection_options([child.name, parent.name], {child.name: child_alias, parent.name: parent_alias}, catalog, build_context)
     candidates: list[SpjCandidate] = []
 
@@ -1267,6 +1310,7 @@ def build_path_candidates(
         per_table_seed_limit=2 if many_tables else 4,
         max_predicates_per_query=min(3, max(1, config.max_predicates_per_table)),
         build_context=build_context,
+        config=config,
     )
     rule_family = "join_order_chain" if join_type == "inner" else "left_chain"
     candidates: list[SpjCandidate] = []
@@ -1406,6 +1450,7 @@ def build_star_candidates(
         per_table_seed_limit=2 if many_tables else 3,
         max_predicates_per_query=min(3, max(1, config.max_predicates_per_table)),
         build_context=build_context,
+        config=config,
     )
     candidates: list[SpjCandidate] = []
     for predicates in predicate_groups:
@@ -1681,6 +1726,18 @@ def select_candidates_for_stage(
     ordered = ordered_candidates(candidates, seed)
     diagnostics = _diagnostic_bucket()
     diagnostics["retained_before_probe"] = len(ordered)
+
+    # --- Deduplicate by SQL signature BEFORE probing ---
+    seen_sql: set[str] = set()
+    unique_ordered: list[SpjCandidate] = []
+    for candidate in ordered:
+        sql_signature = normalize_sql(candidate.render_sql())
+        if sql_signature not in seen_sql:
+            seen_sql.add(sql_signature)
+            unique_ordered.append(candidate)
+    diagnostics["unique_before_probe"] = len(unique_ordered)
+    ordered = unique_ordered
+
     probe_modes = {"stats_plus_selective_probes", "stats_plus_estimated_probes"}
     selective_stages = {"1_table", "2_table"}
     estimated_stages = {"1_table", "2_table", "3_table", "4_table"}
@@ -1691,16 +1748,7 @@ def select_candidates_for_stage(
         and stage_id in probe_stages
     )
     if not should_probe:
-        selected: list[SpjCandidate] = []
-        seen_sql: set[str] = set()
-        for candidate in ordered:
-            sql_signature = normalize_sql(candidate.render_sql())
-            if sql_signature in seen_sql:
-                continue
-            seen_sql.add(sql_signature)
-            selected.append(candidate)
-            if len(selected) >= budget:
-                break
+        selected = ordered[:budget]
         diagnostics["selected"] = len(selected)
         return selected, diagnostics
 
@@ -1712,16 +1760,11 @@ def select_candidates_for_stage(
     if workers <= 1 or not hasattr(provider, "clone"):
         start_calls = getattr(provider, "probe_calls", 0)
         selected: list[SpjCandidate] = []
-        seen_sql: set[str] = set()
         for candidate in ordered:
             calibrate_candidate(candidate, snapshot, provider)
             diagnostics["probed"] += 1
             if candidate.observed_rows == 0:
                 continue
-            sql_signature = normalize_sql(candidate.render_sql())
-            if sql_signature in seen_sql:
-                continue
-            seen_sql.add(sql_signature)
             selected.append(candidate)
             if len(selected) >= budget:
                 break
@@ -1744,7 +1787,6 @@ def select_candidates_for_stage(
         return candidate
 
     selected: list[SpjCandidate] = []
-    seen_sql: set[str] = set()
     batch_size = max(workers, min(len(ordered), budget * 4))
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1759,10 +1801,6 @@ def select_candidates_for_stage(
                     diagnostics["probed"] += 1
                     if candidate.observed_rows == 0:
                         continue
-                    sql_signature = normalize_sql(candidate.render_sql())
-                    if sql_signature in seen_sql:
-                        continue
-                    seen_sql.add(sql_signature)
                     selected.append(candidate)
                 if len(selected) >= budget:
                     break
