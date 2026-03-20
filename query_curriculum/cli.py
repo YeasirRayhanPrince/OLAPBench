@@ -53,7 +53,8 @@ def build_config(args: argparse.Namespace) -> GeneratorConfig:
 
     explicit_stage_values = args.stage_budget or []
     if explicit_stage_values:
-        stage_budgets = parse_stage_budgets(explicit_stage_values, {})
+        base = default_stage_budgets(args.max_join_tables if args.max_join_tables is not None else 4)
+        stage_budgets = parse_stage_budgets(explicit_stage_values, base)
     else:
         stage_budgets = default_stage_budgets(config_data.get("max_join_tables", args.max_join_tables or 4))
         stage_budgets.update(config_data.get("stage_budgets", {}))

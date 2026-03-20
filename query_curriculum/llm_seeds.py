@@ -34,6 +34,10 @@ def build_llm_seed_templates(
         from query_curriculum.core import repo_root
         cache_dir = repo_root() / "benchmarks" / benchmark / ".llm_seed_cache"
 
+    if not _filterable_columns(table):
+        logger.debug("Skipping LLM seeds for %s: no filterable columns (all PK/FK)", table.name)
+        return []
+
     cached = _load_cache(cache_dir, table.name)
     if cached is not None:
         seeds = _entries_to_seeds(table, cached)
