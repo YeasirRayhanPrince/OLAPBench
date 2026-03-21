@@ -52,8 +52,8 @@ STATS_MODE="schema_plus_llm"
 #   gpt-4o        — more creative/diverse values, ~10x cost of 4o-mini
 #   gpt-4.1       — best quality, overkill for seeds, ~10x cost of 4.1-mini
 LLM_SEED_MODEL="gpt-4o-mini"
-# OpenAI API key (required when STATS_MODE=schema_plus_llm)
-OPENAI_API_KEY=""
+# OpenAI API key is read from the environment when STATS_MODE=schema_plus_llm
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 # ── SPJ-specific: template packs & stage budgets ───────────────────────────
 # Template packs are only used for --branch spj (ignored by other branches).
@@ -156,6 +156,11 @@ fi
 cd "${REPO_ROOT}"
 source "${VENV_ACTIVATE}"
 echo "Activated virtual environment: ${VENV_ACTIVATE}"
+
+if [[ "${STATS_MODE}" == "schema_plus_llm" && -z "${OPENAI_API_KEY}" ]]; then
+    echo "OPENAI_API_KEY must be set in the environment when STATS_MODE=schema_plus_llm" >&2
+    exit 1
+fi
 
 if [[ -n "${OPENAI_API_KEY}" ]]; then
     export OPENAI_API_KEY
