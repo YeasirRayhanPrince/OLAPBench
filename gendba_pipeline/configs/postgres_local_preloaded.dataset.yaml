@@ -32,8 +32,8 @@ systems:
       user: yrayhan
       database: postgres
 benchmarks:
-  - name: job
-    # query_dir: full_v0
+  - name: gendba-pool
+    query_dir: full_v1
 export:
-  training_jsonl_name: job.validation.jsonl
-  manifest_jsonl_name: job.manifest.jsonl
+  training_jsonl_name: gendba_ext.training.jsonl
+  manifest_jsonl_name: gendba_ext.manifest.jsonl

@@ -21,6 +21,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.benchmark import benchmarks as benchmark_descriptions
+from gendba_pipeline.phys_plan.tokenize_physical_plan import (
+    load_table_name_to_id,
+    tokenize_physical_plan,
+)
 
 
 @dataclass
@@ -189,6 +193,7 @@ def _load_group_specs(run_root: Path) -> dict[str, dict[str, Any]]:
             "workload": benchmark.unique_name,
             "query_set": _query_set_id(benchmark.query_dir),
             "queries_path": str(Path(benchmark.queries_path)),
+            "schema_path": Path(benchmark.path) / f"{benchmark.name}.dbschema.json",
         }
 
     if not group_specs:
@@ -284,6 +289,13 @@ def rebuild_existing_exports(dataset_root: Path, run_id: str | None = None) -> t
     export_timestamp = run_root.name
 
     group_specs = _load_group_specs(run_root)
+
+    table_name_to_id_by_group: dict[str, dict[str, int]] = {}
+    for group_key, spec in group_specs.items():
+        schema_path = spec.get("schema_path")
+        if schema_path and Path(schema_path).exists():
+            table_name_to_id_by_group[group_key] = load_table_name_to_id(schema_path)
+
     query_entries = _load_query_entries(group_specs)
     logical_records = _load_logical_records(run_root)
     physical_tokens_by_engine, physical_sources_by_engine = _load_physical_records(run_root)
@@ -319,6 +331,21 @@ def rebuild_existing_exports(dataset_root: Path, run_id: str | None = None) -> t
             if source is not None:
                 physical_source_map[engine_key] = source
 
+        logical_ir = logical_record["logical_tokenized_plan"]
+
+        phys_token_strs: dict[str, str] = {}
+        phys_cardinalities: dict[str, list[int]] = {}
+        if table_name_to_id_by_group:
+            tbl_map = table_name_to_id_by_group.get(entry.group_key, {})
+            pred_reg = logical_record.get("pred_registry")
+            for engine_key, raw_phys in physical_token_map.items():
+                result = tokenize_physical_plan(logical_ir, raw_phys, tbl_map,
+                                                pred_registry=pred_reg)
+                if result:
+                    tok, cards = result
+                    phys_token_strs[engine_key] = tok
+                    phys_cardinalities[engine_key] = cards
+
         training_rows.append(
             {
                 "id": next_id,
@@ -327,6 +354,8 @@ def rebuild_existing_exports(dataset_root: Path, run_id: str | None = None) -> t
                 "sql": entry.sql,
                 "ir_logical_token": logical_record["logical_tokenized_plan"],
                 "ir_physical_token": physical_token_map,
+                "ir_physical_plan_token": phys_token_strs,
+                "ir_physical_plan_cardinalities": phys_cardinalities,
             }
         )
 

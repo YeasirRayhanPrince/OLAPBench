@@ -16,3 +16,5 @@ pipeline/output/**
 !pipeline/output/**/*.jsonl
 benchmarks/job/queries_spj_v1
 benchmarks/job/queries_spj_v2
+benchmarks/job/.llm_seed_cache
+subquery_papers

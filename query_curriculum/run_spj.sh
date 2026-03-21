@@ -43,7 +43,7 @@ JOIN_TYPES=("inner" "left")
 #   stats_only                    — real column stats from pg_stats (requires PG, no live probes)
 #   stats_plus_selective_probes   — stats + live COUNT(*) probes to verify selectivity (requires PG, slow on large datasets)
 #   stats_plus_estimated_probes   — stats + EXPLAIN-based estimated row counts (requires PG, fast)
-STATS_MODE="schema_only"
+STATS_MODE="schema_plus_llm"
 # OpenAI model for LLM seed generation (only used when STATS_MODE=schema_plus_llm)
 # Options (cheapest → best):
 #   gpt-4o-mini   — fast & cheapest, good enough for seed generation (default)
@@ -51,7 +51,7 @@ STATS_MODE="schema_only"
 #   gpt-4.1-mini  — better JSON adherence, slightly pricier
 #   gpt-4o        — more creative/diverse values, ~10x cost of 4o-mini
 #   gpt-4.1       — best quality, overkill for seeds, ~10x cost of 4.1-mini
-LLM_SEED_MODEL="gpt-5"
+LLM_SEED_MODEL="gpt-4o-mini"
 # OpenAI API key (required when STATS_MODE=schema_plus_llm)
 OPENAI_API_KEY=""
 
@@ -61,10 +61,19 @@ TEMPLATE_PACKS=("job_like_implicit_joins")
 
 # Stage budgets control how many queries are generated per join-width stage.
 # These are SPJ-specific; other branches use their own internal defaults.
-STAGE_1_QUERIES="50"
-STAGE_2_QUERIES="100"
-STAGE_3_QUERIES="100"
-STAGE_4_QUERIES="100"
+STAGE_1_QUERIES="2000"
+STAGE_2_QUERIES="2000"
+STAGE_3_QUERIES="2000"
+STAGE_4_QUERIES="2000"
+# Budgets for 5+ table joins (only used when MAX_JOIN_TABLES > 4)
+STAGE_5_QUERIES="1000"
+STAGE_6_QUERIES="1000"
+STAGE_7_QUERIES="400"
+STAGE_8_QUERIES="300"
+STAGE_9_QUERIES="200"
+STAGE_10_QUERIES="100"
+STAGE_11_QUERIES="100"
+STAGE_12_QUERIES="100"
 
 # ── Plan collection (requires PG) ──────────────────────────────────────────
 # Set to true to append --collect-plans (collects EXPLAIN plans via PG).
@@ -110,6 +119,22 @@ if [[ "${BRANCH}" == "spj" || "${BRANCH}" == "full" ]]; then
         --stage-budget "3_table=${STAGE_3_QUERIES}"
         --stage-budget "4_table=${STAGE_4_QUERIES}"
     )
+    # Conditionally add stage budgets for 5+ table joins
+    declare -a STAGE_EXTRA_BUDGETS=(
+        [5]="${STAGE_5_QUERIES}"
+        [6]="${STAGE_6_QUERIES}"
+        [7]="${STAGE_7_QUERIES}"
+        [8]="${STAGE_8_QUERIES}"
+        [9]="${STAGE_9_QUERIES}"
+        [10]="${STAGE_10_QUERIES}"
+        [11]="${STAGE_11_QUERIES}"
+        [12]="${STAGE_12_QUERIES}"
+    )
+    for stage in 5 6 7 8 9 10 11 12; do
+        if [[ "${MAX_JOIN_TABLES}" -ge "${stage}" ]]; then
+            CMD+=(--stage-budget "${stage}_table=${STAGE_EXTRA_BUDGETS[${stage}]}")
+        fi
+    done
     for template_pack in "${TEMPLATE_PACKS[@]}"; do
         CMD+=(--template-pack "${template_pack}")
     done

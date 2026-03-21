@@ -24,9 +24,9 @@ set -euo pipefail
 #   ./gendba_pipeline/rebuild_exports_from_existing_run.sh \
 #     --dataset-root gendba_pipeline/output/gendba_local_postgres_preloaded
 #
-#   ./gendba_pipeline/rebuild_exports_from_existing_run.sh \
-#     --dataset-root gendba_pipeline/output/gendba_local_postgres_preloaded \
-#     --run-id 20260308T161542Z
+  # ./gendba_pipeline/rebuild_exports_from_existing_run.sh \
+  #   --dataset-root gendba_pipeline/output/gendba_local_postgres_preloaded \
+  #   --run-id 20260320T062124Z
 #
 # Notes:
 # - If you do not pass --run-id, the Python script uses the latest run in <dataset-root>/work/.

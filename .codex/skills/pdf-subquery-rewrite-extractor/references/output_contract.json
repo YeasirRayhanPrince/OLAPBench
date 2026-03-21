@@ -1,0 +1,171 @@
+{
+  "type": "array",
+  "description": "Structured rewrite examples extracted from optimizer papers for downstream query template generation.",
+  "items": {
+    "type": "object",
+    "required": [
+      "paper_id",
+      "source_pdf",
+      "example_id",
+      "transformation_name",
+      "subquery_type",
+      "generator_fit",
+      "before_sql",
+      "after_sql",
+      "unnesting_logic",
+      "semantic_preconditions",
+      "query_curriculum_mapping"
+    ],
+    "properties": {
+      "paper_id": {
+        "type": "string",
+        "description": "Short stable id such as oracle or sqlserver_01."
+      },
+      "source_pdf": {
+        "type": "string",
+        "description": "Workspace-relative path to the source PDF."
+      },
+      "example_id": {
+        "type": "string",
+        "description": "Stable local id such as q8, ex3, fig7_q1, or page12_case2."
+      },
+      "section": {
+        "type": ["string", "null"]
+      },
+      "page_hint": {
+        "type": ["string", "null"],
+        "description": "Page number or nearby locator if exact paging is noisy."
+      },
+      "transformation_name": {
+        "type": "string",
+        "description": "Paper-facing name such as subquery unnesting, subquery coalescing, scalar decorrelation, or view merge."
+      },
+      "subquery_type": {
+        "type": "string",
+        "enum": [
+          "exists",
+          "not_exists",
+          "in_subquery",
+          "scalar",
+          "derived",
+          "coalesced",
+          "setop",
+          "window_rewrite",
+          "other"
+        ]
+      },
+      "generator_fit": {
+        "type": "string",
+        "enum": ["exact", "approximate", "future"]
+      },
+      "before_sql": {
+        "type": ["string", "null"],
+        "description": "Original paper SQL. Null only when the paper omits it."
+      },
+      "after_sql": {
+        "type": ["string", "null"],
+        "description": "Rewritten SQL. Null only when the paper omits it."
+      },
+      "normalized_before_sql": {
+        "type": ["string", "null"]
+      },
+      "normalized_after_sql": {
+        "type": ["string", "null"]
+      },
+      "sql_source": {
+        "type": "string",
+        "enum": [
+          "paper_verbatim",
+          "paper_with_whitespace_normalization",
+          "inferred_normalization",
+          "partial_reconstruction"
+        ]
+      },
+      "unnesting_logic": {
+        "type": "string",
+        "description": "Concise explanation of why the rewrite is valid and what optimizer behavior it enables."
+      },
+      "semantic_preconditions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Null-sensitivity, duplicate handling, correlation shape, aggregate requirements, uniqueness assumptions, containment tests, and similar conditions."
+      },
+      "blocked_by": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Conditions that prevent or complicate the rewrite."
+      },
+      "query_curriculum_mapping": {
+        "type": "object",
+        "required": [
+          "stage_id",
+          "rule_family"
+        ],
+        "properties": {
+          "stage_id": {
+            "type": "string",
+            "description": "Current stage id or future."
+          },
+          "rule_family": {
+            "type": "string",
+            "description": "Current rule family or a proposed future family name."
+          },
+          "subquery_type": {
+            "type": ["string", "null"]
+          },
+          "operator_targets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "template_hooks": {
+        "type": "object",
+        "description": "Optional placeholders useful for template generation.",
+        "properties": {
+          "outer_tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "inner_tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "correlation_predicates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "filter_predicates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "aggregate_functions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "notes": {
+        "type": ["string", "null"]
+      }
+    },
+    "additionalProperties": true
+  }
+}
