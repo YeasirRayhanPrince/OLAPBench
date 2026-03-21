@@ -13,7 +13,7 @@ set -euo pipefail
 # Branches and what they generate:
 #   spj       — Select-Project-Join queries (Scan, Filter, Join, Project)
 #   agg       — Aggregation queries (GroupBy, Aggregate functions)
-#   subquery  — Subquery queries (EXISTS, IN, scalar subqueries)
+#   subquery  — Subquery queries (EXISTS, IN, NOT IN, scalar agg, quantified ALL/ANY)
 #   setop     — Set operation queries (UNION, INTERSECT, EXCEPT)
 #   window    — Window function queries (ROW_NUMBER, RANK, aggregates OVER)
 #   cte       — Common Table Expression queries (WITH ... AS)

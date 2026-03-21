@@ -1,8 +1,8 @@
 """Subquery curriculum generator.
 
-Generates EXISTS, NOT EXISTS, IN-subquery, scalar subquery, and derived table
-queries to exercise SemiJoin, AntiJoin, SubqueryScan, and NestedLoop physical
-operators.
+Generates EXISTS, NOT EXISTS, IN, NOT IN, scalar aggregate, quantified (ALL/ANY),
+and derived table queries to exercise SemiJoin, AntiJoin, NullAwareAntiJoin,
+SubqueryScan, and NestedLoop physical operators.
 """
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ class SubqueryCandidate:
     stage_id: str
     tables: list[str]
     base_table: str
-    subquery_type: str  # "exists", "not_exists", "in_subquery", "scalar", "derived"
+    subquery_type: str  # "exists", "not_exists", "in_subquery", "not_in_subquery", "scalar", "quantified", "derived"
     outer_predicates: list[PredicateSpec]
     inner_predicates: list[PredicateSpec]
     # FK correlation: outer_table.outer_col = inner_table.inner_col
@@ -64,6 +64,9 @@ class SubqueryCandidate:
     # For scalar subquery: the aggregate in the inner query
     scalar_agg_func: str | None = None
     scalar_agg_col: str | None = None
+    # For quantified comparisons: operator and outer comparison column
+    quantified_op: str | None = None  # e.g., "> ALL", "< ANY"
+    quantified_compare_col: str | None = None
     # For derived tables: the derived alias and columns
     derived_alias: str | None = None
     derived_columns: list[tuple[str, str]] | None = None  # (alias, col)
@@ -95,6 +98,7 @@ class SubqueryCandidate:
             self.correlation_inner_table, self.correlation_inner_col,
             self.in_column,
             self.scalar_agg_func, self.scalar_agg_col,
+            self.quantified_op, self.quantified_compare_col,
             tuple(
                 (p.table, p.column, p.operator, _hashable_value(p.value), p.family)
                 for p in self.outer_predicates
@@ -156,6 +160,19 @@ class SubqueryCandidate:
             )
             where_parts.append(sub)
 
+        elif self.subquery_type == "not_in_subquery":
+            in_col = self.in_column or self.correlation_outer_col
+            in_alias = self.in_alias or self.correlation_inner_alias
+            inner_where: list[str] = []
+            for p in self.inner_predicates:
+                inner_where.append(render_predicate(p))
+            inner_where_sql = f" WHERE {' AND '.join(inner_where)}" if inner_where else ""
+            sub = (
+                f"{self.correlation_outer_alias}.{self.correlation_outer_col} NOT IN "
+                f"(SELECT {in_alias}.{in_col} FROM {self.correlation_inner_table} AS {in_alias}{inner_where_sql})"
+            )
+            where_parts.append(sub)
+
         elif self.subquery_type == "scalar":
             func = self.scalar_agg_func or "MAX"
             col = self.scalar_agg_col or self.correlation_inner_col
@@ -171,6 +188,20 @@ class SubqueryCandidate:
                 f"(SELECT {func}({self.correlation_inner_alias}.{col}) "
                 f"FROM {self.correlation_inner_table} AS {self.correlation_inner_alias} "
                 f"WHERE {' AND '.join(inner_where)})"
+            )
+            where_parts.append(sub)
+
+        elif self.subquery_type == "quantified":
+            op = self.quantified_op or "> ALL"
+            compare_col = self.quantified_compare_col or self.correlation_outer_col
+            inner_where: list[str] = []
+            for p in self.inner_predicates:
+                inner_where.append(render_predicate(p))
+            inner_where_sql = f" WHERE {' AND '.join(inner_where)}" if inner_where else ""
+            sub = (
+                f"{self.correlation_outer_alias}.{compare_col} {op} "
+                f"(SELECT {self.correlation_inner_alias}.{self.correlation_inner_col} "
+                f"FROM {self.correlation_inner_table} AS {self.correlation_inner_alias}{inner_where_sql})"
             )
             where_parts.append(sub)
 
@@ -245,6 +276,8 @@ class SubqueryCandidate:
                 "inner_table": self.correlation_inner_table,
                 "inner_column": self.correlation_inner_col,
             },
+            **({"scalar_agg_func": self.scalar_agg_func} if self.scalar_agg_func else {}),
+            **({"quantified_op": self.quantified_op} if self.quantified_op else {}),
         }
 
 
@@ -435,6 +468,213 @@ def _build_derived_table_candidates(
     return candidates
 
 
+def _pick_scalar_agg_column(
+    table: TableSchema, exclude_cols: set[str],
+) -> ColumnSchema | None:
+    """Pick a numeric column suitable for aggregation, preferring non-key columns."""
+    best: ColumnSchema | None = None
+    for col in table.columns.values():
+        if not col.is_numeric or col.name in exclude_cols:
+            continue
+        if not col.is_primary_key and not col.is_foreign_key:
+            return col  # ideal: non-key numeric column
+        if best is None:
+            best = col  # fallback: key numeric column
+    return best
+
+
+def _build_scalar_subquery_candidates(
+    join_edges: list[JoinEdge],
+    catalog: dict[str, TableSchema],
+    snapshot: StatsSnapshot,
+    config: GeneratorConfig,
+    build_context: SpjBuildContext | None = None,
+) -> list[SubqueryCandidate]:
+    """Correlated scalar aggregate subqueries: WHERE outer.col = (SELECT AGG(inner.col) FROM inner WHERE correlation)."""
+    candidates: list[SubqueryCandidate] = []
+
+    for edge in join_edges:
+        if edge.child_table not in catalog or edge.parent_table not in catalog:
+            continue
+        parent = catalog[edge.parent_table]
+        child = catalog[edge.child_table]
+        agg_col = _pick_scalar_agg_column(child, {edge.child_column})
+        if agg_col is None:
+            continue
+
+        parent_alias = alias_map([parent.name])[parent.name]
+        child_alias = alias_map([child.name])[child.name]
+        if parent_alias == child_alias:
+            child_alias = child_alias + "2"
+
+        parent_seeds = top_seed_pool(parent, parent_alias, snapshot, limit=3, build_context=build_context)
+        child_seeds = top_seed_pool(child, child_alias, snapshot, limit=3, build_context=build_context)
+
+        proj_options = cached_projection_options(
+            [parent.name], {parent.name: parent_alias}, catalog, build_context,
+        )
+
+        for func in ("MIN", "MAX", "AVG", "SUM"):
+            for outer_preds in [[], parent_seeds[:1]] if parent_seeds else [[]]:
+                for inner_preds in [[], child_seeds[:1]] if child_seeds else [[]]:
+                    estimated = average_selectivity(list(outer_preds) + list(inner_preds))
+                    bucket = bucket_for_selectivity(estimated)
+                    families = sorted({p.family for p in list(outer_preds) + list(inner_preds)}) or ["subquery"]
+                    for pw, pcols in proj_options[:2]:
+                        candidates.append(SubqueryCandidate(
+                            stage_id="2_table_scalar",
+                            tables=[parent.name, child.name],
+                            base_table=parent.name,
+                            subquery_type="scalar",
+                            outer_predicates=list(outer_preds),
+                            inner_predicates=list(inner_preds),
+                            correlation_outer_table=parent.name,
+                            correlation_outer_alias=parent_alias,
+                            correlation_outer_col=edge.parent_column,
+                            correlation_inner_table=child.name,
+                            correlation_inner_alias=child_alias,
+                            correlation_inner_col=edge.child_column,
+                            scalar_agg_func=func,
+                            scalar_agg_col=agg_col.name,
+                            projections=pcols,
+                            projection_width=pw,
+                            predicate_families=families,
+                            target_selectivity_bucket=bucket,
+                            estimated_selectivity=estimated,
+                            rule_family="scalar_subquery",
+                            calibration_source="pg_stats" if snapshot.column_stats else "schema",
+                        ))
+
+    return candidates
+
+
+def _build_not_in_subquery_candidates(
+    join_edges: list[JoinEdge],
+    catalog: dict[str, TableSchema],
+    snapshot: StatsSnapshot,
+    config: GeneratorConfig,
+    build_context: SpjBuildContext | None = None,
+) -> list[SubqueryCandidate]:
+    """NOT IN (subquery) candidates — exercises NullAwareAntiJoin operators."""
+    candidates: list[SubqueryCandidate] = []
+
+    for edge in join_edges:
+        if edge.child_table not in catalog or edge.parent_table not in catalog:
+            continue
+        parent = catalog[edge.parent_table]
+        child = catalog[edge.child_table]
+        parent_alias = alias_map([parent.name])[parent.name]
+        child_alias = alias_map([child.name])[child.name]
+        if parent_alias == child_alias:
+            child_alias = child_alias + "2"
+
+        child_seeds = top_seed_pool(child, child_alias, snapshot, limit=3, build_context=build_context)
+        parent_seeds = top_seed_pool(parent, parent_alias, snapshot, limit=3, build_context=build_context)
+
+        proj_options = cached_projection_options(
+            [parent.name], {parent.name: parent_alias}, catalog, build_context,
+        )
+
+        for inner_preds in [[], child_seeds[:1]] if child_seeds else [[]]:
+            for outer_preds in [[], parent_seeds[:1]] if parent_seeds else [[]]:
+                estimated = average_selectivity(list(outer_preds) + list(inner_preds))
+                bucket = bucket_for_selectivity(estimated)
+                families = sorted({p.family for p in list(outer_preds) + list(inner_preds)}) or ["subquery"]
+                for pw, pcols in proj_options[:2]:
+                    candidates.append(SubqueryCandidate(
+                        stage_id="2_table_not_in",
+                        tables=[parent.name, child.name],
+                        base_table=parent.name,
+                        subquery_type="not_in_subquery",
+                        outer_predicates=list(outer_preds),
+                        inner_predicates=list(inner_preds),
+                        correlation_outer_table=parent.name,
+                        correlation_outer_alias=parent_alias,
+                        correlation_outer_col=edge.parent_column,
+                        correlation_inner_table=child.name,
+                        correlation_inner_alias=child_alias,
+                        correlation_inner_col=edge.child_column,
+                        in_column=edge.child_column,
+                        in_alias=child_alias,
+                        projections=pcols,
+                        projection_width=pw,
+                        predicate_families=families,
+                        target_selectivity_bucket=bucket,
+                        estimated_selectivity=estimated,
+                        rule_family="not_in_subquery",
+                        calibration_source="pg_stats" if snapshot.column_stats else "schema",
+                    ))
+
+    return candidates
+
+
+def _build_quantified_candidates(
+    join_edges: list[JoinEdge],
+    catalog: dict[str, TableSchema],
+    snapshot: StatsSnapshot,
+    config: GeneratorConfig,
+    build_context: SpjBuildContext | None = None,
+) -> list[SubqueryCandidate]:
+    """Quantified comparison subqueries: WHERE outer.col > ALL / < ANY (SELECT inner.col ...)."""
+    candidates: list[SubqueryCandidate] = []
+
+    for edge in join_edges:
+        if edge.child_table not in catalog or edge.parent_table not in catalog:
+            continue
+        parent = catalog[edge.parent_table]
+        child = catalog[edge.child_table]
+
+        # Need numeric columns on both sides for meaningful comparisons
+        outer_num = _pick_scalar_agg_column(parent, set())
+        inner_num = _pick_scalar_agg_column(child, set())
+        if outer_num is None or inner_num is None:
+            continue
+
+        parent_alias = alias_map([parent.name])[parent.name]
+        child_alias = alias_map([child.name])[child.name]
+        if parent_alias == child_alias:
+            child_alias = child_alias + "2"
+
+        child_seeds = top_seed_pool(child, child_alias, snapshot, limit=3, build_context=build_context)
+
+        proj_options = cached_projection_options(
+            [parent.name], {parent.name: parent_alias}, catalog, build_context,
+        )
+
+        for op in ("> ALL", "< ALL", ">= ANY", "<= ANY"):
+            rule_family = "quantified_all" if "ALL" in op else "quantified_any"
+            for inner_preds in [[], child_seeds[:1]] if child_seeds else [[]]:
+                estimated = average_selectivity(list(inner_preds))
+                bucket = bucket_for_selectivity(estimated)
+                families = sorted({p.family for p in inner_preds}) or ["subquery"]
+                for pw, pcols in proj_options[:1]:
+                    candidates.append(SubqueryCandidate(
+                        stage_id="2_table_quantified",
+                        tables=[parent.name, child.name],
+                        base_table=parent.name,
+                        subquery_type="quantified",
+                        outer_predicates=[],
+                        inner_predicates=list(inner_preds),
+                        correlation_outer_table=parent.name,
+                        correlation_outer_alias=parent_alias,
+                        correlation_outer_col=edge.parent_column,
+                        correlation_inner_table=child.name,
+                        correlation_inner_alias=child_alias,
+                        correlation_inner_col=inner_num.name,
+                        quantified_op=op,
+                        quantified_compare_col=outer_num.name,
+                        projections=pcols,
+                        projection_width=pw,
+                        predicate_families=families,
+                        target_selectivity_bucket=bucket,
+                        estimated_selectivity=estimated,
+                        rule_family=rule_family,
+                        calibration_source="pg_stats" if snapshot.column_stats else "schema",
+                    ))
+
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Deduplication & selection
 # ---------------------------------------------------------------------------
@@ -527,6 +767,9 @@ def default_subquery_stage_budgets() -> dict[str, int]:
         "2_table_semi": 18,
         "2_table_anti": 18,
         "2_table_derived": 12,
+        "2_table_scalar": 18,
+        "2_table_not_in": 12,
+        "2_table_quantified": 12,
     }
 
 
@@ -548,6 +791,9 @@ def generate_subquery_workload(
     all_candidates.extend(_build_exists_candidates(join_edges, catalog, snapshot, config, build_context))
     all_candidates.extend(_build_in_subquery_candidates(join_edges, catalog, snapshot, config, build_context))
     all_candidates.extend(_build_derived_table_candidates(join_edges, catalog, snapshot, config, build_context))
+    all_candidates.extend(_build_scalar_subquery_candidates(join_edges, catalog, snapshot, config, build_context))
+    all_candidates.extend(_build_not_in_subquery_candidates(join_edges, catalog, snapshot, config, build_context))
+    all_candidates.extend(_build_quantified_candidates(join_edges, catalog, snapshot, config, build_context))
 
     budgets = default_subquery_stage_budgets()
     for stage_id, budget in config.stage_budgets.items():

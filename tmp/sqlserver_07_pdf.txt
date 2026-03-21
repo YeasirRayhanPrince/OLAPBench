@@ -1,0 +1,733 @@
+                     
+                                               Execution Strategies for SQL Subqueries 
+                                       Mostafa Elhemali, César A. Galindo-Legaria, Torsten Grabs, Milind M. Joshi 
+                                                                Microsoft Corp., One Microsoft Way, Redmond, WA 98052 
+                                                                     {mostafae, cesarg, torsteng, milindj}@microsoft.com 
+                                                   
+                    ABSTRACT                                                                                     thogonally in all SQL clauses SELECT, FROM, WHERE, and 
+                    Optimizing SQL subqueries has been an active area in database                                HAVING. This facilitates query formulation in important applica-
+                    research and the database industry throughout the last decades. Pre-                         tion domains such as decision support, applications which automati-
+                    vious work has already identified some approaches to efficiently                             cally generate SQL queries, and new query languages.  
+                    execute relational subqueries. For satisfactory performance, proper                          1.1  Application Scenarios 
+                    choice of subquery execution strategies becomes even more essen-                             Decision Support. Decision support benchmarks such as TPC-H 
+                    tial today with the increase in decision support systems and auto-                           and TPC-DS make extensive use of subqueries: out of the 22 que-
+                    matically generated SQL, e.g., with ad-hoc reporting tools. This                             ries in the TPC-H benchmark, 10 queries use subqueries. Subqueries 
+                    goes hand in hand with increasing query complexity and growing                               occur in the WHERE clause for 9 of the TPC-H queries and one 
+                    data volumes – which all pose challenges for an industrial-strength                          query uses subqueries in the HAVING clause. A common practice 
+                    query optimizer.                                                                             is to relate a nested subquery to the outer query such that the sub-
+                    This current paper explores the basic building blocks that Microsoft                         query only processes values relevant to the rows of the outer query. 
+                    SQL Server utilizes to optimize and execute relational subqueries.                           This introduces a so-called correlation between the outer query and 
+                    We start with indispensable prerequisites such as detection and                              the subquery. As we will discuss in more detail, correlations make it 
+                    removal of correlations for subqueries. We identify a full spectrum                          challenging to find well-performing execution plans for queries with 
+                    of fundamental subquery execution strategies such as forward and                             subqueries. 
+                    reverse lookup as well as set-based approaches, explain the different                        Automatically Generated Queries. Today, end users oftentimes 
+                    execution strategies for subqueries implemented in SQL Server, and                           use graphical interfaces to compose ad-hoc queries or to define 
+                    relate them to the current state of the art. To the best of our knowl-                       reports against an underlying data store. The application behind the 
+                    edge, several strategies discussed in this paper have not been pub-                          user interface then automatically generates SQL queries based on 
+                    lished before.                                                                               the interactive input provided by the end user. Microsoft SQL 
+                    An experimental evaluation complements the paper. It quantifies the                          Server 2005 Reporting Services is an example of such an applica-
+                    performance characteristics of the different approaches and shows                            tion: customers can define a model on top of a data store and inte-
+                    that indeed alternative execution strategies are needed in different                         ractively query the data behind the model. These queries are com-
+                    circumstances, which make a cost-based query optimizer indispen-                             piled into SQL if the underlying data store is a relational database 
+                    sable for adequate query performance.                                                        system. The nesting capabilities and the orthogonality of the SQL 
+                                                                                                                 language simplify automatic SQL code generation. The implemen-
+                    Categories and Subject Descriptors                                                           tation of SQL Server Reporting Services relies on these characteris-
+                    H.2.4 [Database Management Systems]: Subjects: Query process-                                tics of the SQL language and – depending on the user query against 
+                    ing, Relational databases. Nouns: Microsoft SQL Server                                       the model – introduces subqueries in the SELECT or the WHERE 
+                                                                                                                 clause. 
+                    General Terms                                                                                “Nested loops” languages.  Unlike SQL, some query languages 
+                    Algorithms, Performance.                                                                     incorporate the notions of iteration and parameterization as a basic 
+                                                                                                                 mechanism.  XQuery is an example [2]. With XQuery, queries are 
+                                                                                                                 formulated using the clauses FOR, LET, WHERE and RETURN 
+                    Keywords                                                                                     which yields so-called FLWR-expressions.  Nested FOR clauses are 
+                    Relational database systems, Query optimization, Subqueries, Mi-                             a common programming pattern, and they are used to iterate over 
+                    crosoft SQL Server.                                                                          XML elements at a given level in the document hierarchy and then 
+                                                                                                                 descend deeper.  The concepts and techniques presented in this 
+                    1.  INTRODUCTION                                                                             paper are applicable to those scenarios as well.  In fact, they are 
+                    Subqueries are a powerful improvement of SQL which has been                                  used in our implementation of XQuery. 
+                    further extended to scalar subqueries by the SQL/92 standard [1].                            1.2  Subquery Processing Overview 
+                    Most of its value derives from the ability to use subqueries or-                             Our overall compilation logic, as it pertains to subquery processing, 
+                                                                                                                 is shown in Figure 1. The framework shown separates distinct steps 
+                     Permission to make digital or hard copies of all or part of this work for                   for the generation of efficient execution plans, and it aims to maxi-
+                     personal or classroom use is granted without fee provided that copies are                   mally leverage the various optimizations. 
+                     not made or distributed for profit or commercial advantage and that copies                  A first step of SQL compilation is the subquery removal process, 
+                     bear this notice and the full citation on the first page. To copy otherwise, or             which is covered in detail in Section 3 of this paper.  The result is a 
+                     republish, to post on servers or to redistribute to lists, requires prior specific          relational expression that uses the Apply operator to abstract param-
+                     permission and/or a fee. 
+                     SIGMOD’07, June 12–14, 2007, Beijing, China. 
+                     Copyright 2007 ACM  978-1-59593-686-8/07/0006...$5.00. 
+                                                                                                          993
+                 
+                                  SQL without                          relational expr              equivalent                physical op-
+                                  subquery                             without Apply                logical re-               timizations 
+                                                                                                    orderings                 Section 8 
+                                                       Apply removal,                               Sections 5, 6, 7 
+                                                       aka decorrelation 
+                                                       Section 4
+                                  “nested loops” 
+                                  languages                            relational expr 
+                                  SQL with                             with Apply 
+                                  subquery                   Subquery removal, 
+                                                             Section 3 
+                                              Parsing and normalization                                        Cost-based optimization 
+                                      Figure 1: Overview of plan generation for subqueries in SQL Server and structure of the paper 
+                eterized execution.  A nested loop language is likely to be parseable        1.4  Challenges and Contributions 
+                directly into this algebraic form.                                           Depending on the cardinalities of the outer query and the subquery 
+                The apply removal process is covered in Section 4 of this paper.  It         as well as the physical design of the database, different subquery 
+                eliminates the use of parameterization, which we identify with               execution strategies may differ greatly in their performance charac-
+                decorrelating.  The result is a relational expression that uses differ-      teristics. This makes it a challenging topic for query optimization. 
+                ent types of joins.                                                          This is reflected by the attention the area has received in previous 
+                The optimizer then explores the decorrelated relational expression           work, e.g., [3, 4, 5, 6, 7, 8]. While [9] has specifically focused on 
+                and generates various alternatives with identical query semantics.           optimization of subqueries with grouping at the logical level, this 
+                We call this the logical level of query optimization. This step aims         current paper takes a broader perspective on the problem. We do not 
+                at producing enough interesting plan alternatives such that a good           limit the discussion to grouping, and we cover both the logical level 
+                query plan is among them. The optimizer computes cost estimates              and the physical level of plan generation. In particular, we investi-
+                for plans and picks the most cost-effective one. A sufficiently broad        gate subqueries introduced by existential or universal quantification. 
+                search space obviously is a prerequisite for good performance.               Throughout the paper, we discuss rewrite strategies for subqueries at 
+                Logical optimizations for subqueries are covered by Section 5 to 7           the logical level and explain how this facilitates finding a good exe-
+                where we discuss strategies for logical exploration of semijoin and          cution plan among navigational and set-oriented alternatives at the 
+                antijoin, techniques to deal with subqueries in disjunctions, and            physical level. In Section 10, our experimental evaluation of differ-
+                some Group By scenarios.                                                     ent subquery execution strategies with Microsoft SQL Server 2005 
+                After exploration of the relational expression is complete, additional       investigates the different plan choices in quantitative terms. The 
+                optimizations at the physical level help to further improve perform-         experiments also assess the effectiveness of a cost-based optimiza-
+                ance. These techniques such as batch sort or prefetch are discussed          tion approach in the presence of subqueries. 
+                in Section 8.                                                                2.  ALGEBRAIC REPRESENTATION  
+                1.3   Subquery Execution Strategies                                          OF SUBQUERIES 
+                The query optimizer explores different physical execution strategies         In this section we describe the algebraic representation of SQL sub-
+                for the various logical query plan alternatives. This step generates         queries.  Having an algebraic representation is beneficial because it 
+                execution plan alternatives with different performance characteris-          abstracts the semantics of operations, making them independent of 
+                tics. In the context of subquery optimization, the following execu-          query language, data structures or specific execution strategies.  It 
+                tion strategies are possible: (1) navigational strategies, or (2) set-       also allows algebraic analysis and reasoning, including capturing 
+                oriented strategies. Navigational strategies rely on nested loop joins       reordering properties in the form of algebraic identities.  Finally, it 
+                for implementation while two interesting classes of navigational             fits well into algebraic query processors like that of SQL Server. 
+                strategies are conceivable, namely forward lookup and reverse                2.1  Terminology 
+                lookup. Forward lookup starts processing the outer query and, as             The basics of our algebraic model were discussed in [9].  Here, we 
+                outer rows are being generated, invokes the subquery one outer row           briefly review this formulation and go over a number of optimiza-
+                at a time. Reverse lookup in turn starts with the subquery and proc-         tions and issues not covered in our earlier work. Since we deal with 
+                esses the outer query one subquery row at a time. Set-oriented proc-         SQL, all operators in this paper are bag-oriented and we assume no 
+                essing finally requires that the query could be successfully decorre-        automatic removal of duplicates.  In particular, the union operator 
+                lated. If this is the case, set operations such as hash and merge join       for most of the remainder of the paper is UNION ALL and we repre-
+                can implement the query.                                                     sent it using UA. Distinct union in turn is denoted as U. Besides 
+                                                                                             union, we rely on the standard relational operators for grouping, 
+                                                                                        994
+                  
+                 selection (filter) and projection: G   R stands for a GROUP BY over                       WHERE C_CUSTKEY = O_CUSTKEY) 
+                                                     A,F                                                   FROM ORDERS 
+                 relation R with a list A of grouping columns and a set F of aggregate 
+                 functions that are applied to each group. π[S]R denotes a projection            An additional issue to note here is that we are crossing a bridge 
+                 of relation R onto the set of columns in S. σ[p]R in turn represents a          between relational expressions and scalar domains.  The subquery is 
+                 selection on relation R where p is used as a predicate to filter quali-         a relational expression, but it is used in a context that expects a sca-
+                 fying rows from R. For ease of presentation, we use CT(1) as a                  lar value, i.e. the SQL SELECT clause.  The rules to bridge this 
+                 shorthand for a constant table which returns one row and no col-                relational/scalar divide are the following: 
+                 umns.Our algebraic formulation of subqueries is based on the gen-               •    If the relational result of the subquery is empty, then its scalar 
+                 eral idea of a parameterized relational expression (PRE) and the                     value is NULL. 
+                 Apply operator, as described in [9].  A PRE is simply a relational              •    If the relational result is a single row {a}, then the scalar value 
+                 expression that has free variables or parameters, so it yields a rela-               is a. 
+                 tional result when values for those parameters are provided.  It is             •    If the relational result has more than one row, then its scalar 
+                 effectively a function.  The Apply operator repeatedly invokes a                     value is undefined and a run-time error is raised. 
+                 PRE with a series of parameters values and collects the results of              For the sake of this example, assume that C_CUSTKEY is a key of 
+                 these multiple invocations.  Formally,                                          CUSTOMER, but O_CUSTKEY is nullable, or there is no declared 
+                                R Apply  E(r) = UA          ({r} JN E(r)).                       foreign-key constraint.  Then the subquery can return at most one 
+                                         JN           r ∈ R                                      row.  We represent this query algebraically as: 
+                 Note that Apply does not take two relational inputs, but only one                    ORDERS Apply  (π [C_NAME] σ [C_CUSTKEY = 
+                 relational input R that provides the set of parameter values, on                                      OJ
+                 which PRE E(r) is applied.  Apply can use different logics to com-                   O_CUSTKEY] CUSTOMER) 
+                 bine each row r with the result of E(r), specified by JN above.  It             Note that this expression outputs exactly the rows from ORDERS, 
+                 supports the common join types such as inner, outer, and semijoins              adding an extra column for each row, with the result of the scalar 
+                 which we briefly review here:                                                   value of the subquery.  
+                 An inner join (R JN  S) is defined as the subset of the Cartesian 
+                                        p                                                        2.2  Language surface 
+                 product of R and S where all tuples that do not satisfy the predicate           In the early days, the SQL block with its SELECT, FROM, and 
+                 p are filtered out.                                                             WHERE clauses was central to the language and there were many 
+                 A left outer join (R LOJ  S) includes the result of an inner join be-           syntactic restrictions around the use of multiple SQL blocks in a 
+                                           p                                                     single query, including subqueries.  Current SQL implementations 
+                 tween R and S with join condition p, plus all the unmatched tuples              allow the use of “sub-selects” in a fully composable way.  There are 
+                 of R extended with NULL values for columns of S. A right outer                  two cases to distinguish: 
+                 join on the other hand contains the unmatched tuples of S along with 
+                 the result of the inner join.                                                   •    A SQL block is used where a relational value such as a table is 
+                 A semijoin (R SJ  S) is defined as all the tuples of R that match at                 expected, in the FROM clause.  Such a “sub-select” is called a 
+                                   p                                                                  derived table.  This is simply about composability of relational 
+                 least one tuple of S on the predicate p, while an antijoin (R ASJ  S) 
+                                                                                     p                expressions and we don’t consider it further in this paper. 
+                 is defined as the tuples of R that match no tuples of S on the predi-           •    A SQL block is used where a scalar expression is expected, 
+                 cate p. Naturally, (R SJ  S) UA (R ASJ  S) = R.  
+                                         p               p                                            such as the SELECT or the WHERE clause.  Such “sub-select” 
+                 For example, an Apply operator can use antijoin logic if it wants to                 is called a subquery.  This subquery is called correlated if it 
+                 preserve row r when the result of E(r) is empty.                                     has free variables that are provided by the enclosing query.  
+                 The Apply operator maps well to the nested loops execution strategy                  Unlike derived tables, subqueries require going across rela-
+                 with correlated parameters, but we treat it here as a logical operators              tional and scalar domains. 
+                 with the semantic definition described above.                                   Subqueries are introduced in scalar expressions in SQL in the fol-
+                                                                                                 lowing ways: 
+                 We illustrate the use of Apply with a simple SQL subquery example.              •    Existential test.  These use keywords EXISTS and NOT EX-
+                 Say you want to list all your ORDERS, and include the CUS-                           ISTS and test whether the result of a subquery is empty.  The 
+                 TOMER name.  It is convenient to have a function that takes a cus-                   result is of type Boolean, either TRUE or FALSE.  For exam-
+                 tomer key and returns the name of the CUSTOMER.  Such function                       ple: 
+                 can be written as follows                                                                 EXISTS(SELECT * FROM ORDERS  
+                            (SELECT C_NAME FROM CUSTOMER                                                   WHERE L_SHIPDATE < O_ORDERDATE). 
+                            WHERE C_CUSTKEY = O_CUSTKEY),                                        •    Quantified comparison.  These test whether a particular com-
+                 where the free variable O_CUSTKEY is the argument of the func-                       parison cmp holds for values returned by a subquery subq.  The 
+                 tion – there is no explicit syntax to bind free variables in SQL, so                 forms are <cmp> ALL <subq>, and <cmp> ANY <subq>.  The 
+                 binding variables in subqueries is done simply by name.  Free vari-                  result is again of type Boolean, but unlike existential subque-
+                 ables will be shown in bold throughout the paper.  We can use this                   ries, quantified comparisons can return TRUE, FALSE or 
+                 “name extraction function” to report all ORDERS with the name of                     UNKNOWN (when null values are involved in the compari-
+                 the CUSTOMER as follows                                                              son).  For example: 
+                            SELECT *, (SELECT C_NAME                                                       L_SHIPDATE > ANY( 
+                            FROM CUSTOMER                                                                  SELECT O_ORDERDATE 
+                                                                                                           FROM ORDERS 
+                                                                                                           WHERE L_ORDERKEY = O_ORDERKEY). 
+                                                                                           995
+                  
+                 •    IN / NOT IN.  This is a shorthand for quantified comparison.             3.1  Mapping multi-row relational  
+                      <expr> IN <subq> is equivalent to <expr> =ANY <subq>.                    results to a single scalar value  
+                      <expr> NOT IN <subq> is equivalent to <expr> <>ALL                       This issue was brought up already in the example query in Section 
+                      <subq>.                                                                  2.  For a scalar-valued subquery E(r), the subquery is computed in 
+                 •    Scalar-valued.  These return non-Boolean scalar values.  For             general as 
+                      example: 
+                           (SELECT C_NAME FROM CUSTOMER                                                              R Apply  max1row(E(r)). 
+                           WHERE C_CUSTKEY = O_CUSTKEY).                                                                     OJ
+                                                                                               max1row is a special relational operator whose output is the same as 
+                 In addition to its internal use in query processing, the Apply operator       its input, but it raises a run-time exception if its input has more than 
+                 is also available in the surface syntax of SQL Server.  The common            one row.  Through static analysis, it is sometimes possible to deter-
+                 usage scenario is the invocation of parameterized table-valued func-          mine at compile time that E(r) will return at most one row, regard-
+                 tions, which are a particular case of PREs.  For example, suppose             less of the parameter value and database content – no max1row 
+                 you have a table-valued function that takes a string and chops it up          operator is required then.  This is a common case in actual applica-
+                 into words, outputting one row per word.  You can use the following           tions. 
+                 to invoke this function on the values of column COL from MY-                  3.2  Filtering through existential test 
+                 TABLE: 
+                           SELECT *                                                            If an existential test on E(r) is used in the context of directly filter-
+                           FROM MYTABLE                                                        ing rows, then we incorporate the filtering operation with the 
+                           OUTER APPLY CHOP_WORDS(MYTABLE.COL)                                 evaluation of the subquery.  The computation of EXISTS and NOT 
+                 Each row of MYTABLE will be repeated as many times as rows                    EXISTS subqueries is done as follows: 
+                                                                                                                            R Apply  E(r) 
+                 returned by the function – but if the function result is empty then the                                            SJ
+                 row is still preserved, due to the use of OUTER.                                                          R Apply     E(r) 
+                                                                                                                                   ASJ
+                 Some implementations of SQL incorporated the ability to pass pa-              In terms of the general rewrite procedure described above, the sub-
+                 rameters across the “comma operator” of the FROM clause.  We                  query occurrence in the original scalar expression S is replaced by 
+                 adopted explicit syntax for parameter passing for conceptual clarity,         the constant TRUE and the result simplified to obtain S’.  This is the 
+                 and also because “comma” doesn’t lend itself to clarifying what to            path followed when existential subqueries are ANDed together with 
+                 do when the PRE returns an empty set, i.e. preserve or reject the row         other conditions in the SQL WHERE clause. 
+                 from the left relational input.                                               Existential subqueries are also used in a context that does not di-
+                 3.  SUBQUERY REMOVAL                                                          rectly filter rows.  In general, they need to be treated like scalar-
+                 A straightforward implementation of subqueries requires tuple-at-a-           valued subqueries, as described in the next scenario. 
+                 time processing in a very specific order – evaluate the PRE for each          3.3  Conditional scalar execution 
+                 row that requires evaluation of the scalar expression.  It also intro-        SQL provides a construct for conditional evaluation of scalar ex-
+                 duces mutual recursion between the scalar and relational execution            pressions, and subqueries can be used there as well.  Implementing 
+                 sub-systems.  Conceptually, relational execution needs to make calls          this semantics properly require the incorporation of probe and pass-
+                 to some scalar evaluation sub-system for predicates and other scalar          through functionality in the Apply operator.  Suppose your expres-
+                 computations (there are multiple ways to implement scalar evalua-             sion is of the form 
+                 tion, as they could be compiled in-place instead of having an actual 
+                 separate component).  If scalar expressions contain subqueries, then                     CASE WHEN EXISTS(E (r))  
+                                                                                                                                      1
+                 the scalar subsystem needs to bind the free variables and make a                         THEN E (r) ELSE 0 END. 
+                                                                                                                   2
+                 recursive call back to relational execution.  Subquery removal is             Note that the EXISTS subquery here is not used to directly filter 
+                 about eliminating this mutual recursion between the scalar and rela-          rows, but to determine the result of a scalar expression.  The sub-
+                 tional execution sub-components.                                              queries will be computed by the following expression: 
+                 The general subquery removal algorithm takes three arguments: a                (R Apply[semijoin, probe as b] E (r)) Apply[outerjoin, pass-through 
+                 relational operator, a relational expressions and a scalar expression                                            1
+                                                                                                                       b=1] max1row(E (r)). 
+                 with subqueries; and it returns new expressions to compute the re-                                                      2
+                 sult without the need of subqueries.  For example, say you have a             Apply with probe preserves the rows from R and adds a new column 
+                 selection of the form σ[p]R, and predicate p has subqueries.  We              b, which is 1 whenever E (r) is non-empty.  Apply with pass-
+                                                                                                                             1
+                 invoke SQREM(σ,p,R) to get (p’, R’), p’ does not use subqueries               through has a guard predicate and only executes its subquery if the 
+                 and σ[p]R = σ[p’]R’.                                                          guard is TRUE.  This implements the required conditional evalua-
+                 Algorithm SQREM is implemented through a simple tree traversal                tion. 
+                 of scalar expression p, which moves all the subquery computation              Assuming the result of the scalar-valued subquery E (r) is left in 
+                                                                                                                                                        2
+                 from p over to relational expression R.  For each subquery PRE(r)             column e , the original scalar expression is replaced to be: 
+                                                                                                         2
+                 found in p, we add a computation Apply PRE(r) on R and replace                 CASE WHEN p = 1 THEN e  ELSE 0 END. 
+                 the subquery in p by a scalar computation.  A more detailed exam-                                                          2
+                 ple is found in [9].                                                          3.4  Disjunctions of subqueries 
+                 For a correct and efficient translation, there are a number of special        When subqueries are used in disjunctions, it is not possible to filter 
+                 cases to incorporate in the basic algorithm outlined above.  They are         directly as we did in Sec. 3.2 with Apply-semijoin or Apply-antijoin.  
+                 listed next.                                                                  Apply with probe can be used to collect the subquery results and 
+                                                                                               evaluate the entire disjunction afterwards, and pass-through can be 
+                                                                                         996
+                
+               used to implement OR-shortcircuiting.  But then it is difficult to       However, this equation holds only in two-valued logic, not in the 
+               convert Apply into join, which, as we shall see later, is a major tool   three-valued logic of SQL (the basic reason is that NOT UN-
+               for efficient execution.                                                 KNOWN is UNKNOWN).  So, we complete the mapping in two 
+               Our mapping of subqueries in disjunctions is based on unions.  Sup-      steps: (1) change the universal quantification σ expression so it does 
+               pose you have a scalar filter condition of the form p(r) OR EX-          not involve UNKNOWN values; (2) negate the predicate. 
+               ISTS(E (r)) OR EXISTS(E (r)), where p(r) is a scalar predicate over      A universal quantification predicate of the form p = A <cmp> B can 
+                       1                  2                                             return UNKNOWN when either A or B are NULL.  So we replace it 
+               r without subqueries.  We map to a filtering relational expression of    by a two-value predicate p’ = A <cmp> B AND A IS NOT NULL 
+               the form:                                                                AND B IS NOT NULL.  Predicate p’ returns TRUE whenever p 
+                            R Apply  ((σ    CT(1) UA E (r) UA E (r)) 
+                                    SJ   p(r)           1        2                      returns TRUE, and p’ returns FALSE whenever p returns either 
+               The scalar predicate p is evaluated on top of the constant table         FALSE or UNKNOWN.  As argued earlier, this mapping preserves 
+               CT(1) (which returns one row and no columns).  A row from R is           correctness under filtering and CASE WHEN contexts. 
+               output when any of the relational expressions underneath the Un-         We then negate p’ to create the NOT EXISTS predicate, to obtain: 
+               ionAll returns a non-empty result.                                                  A <cmp’> B OR A IS NULL OR B IS NULL, 
+               3.5  Dealing with quantified comparisons                                 where <cmp’> is the comparison opposite <cmp>.  Of course, if A 
+               Semantics.  We deal with quantified comparisons by mapping them          or B are not nullable, the expression can be simplified at compila-
+               to existential subqueries, which we have already discussed.  But we      tion time. 
+               need to be particularly careful with universal quantification, whose     Example.  Suppose you start out with a subquery of the form A 
+               semantics in the presence of NULL values is illustrated through an       NOT IN S.  This is first mapped to universal quantification A 
+               example.  Say you have a predicate p of the form 5 NOT IN S,             <>ALL S.  Then it gets mapped to a NOT EXISTS subquery of the 
+               which is equivalent to <>ALL.  The result of this predicate is as        form 
+               follows, for various cases of set S:                                          NOT EXISTS(σ[A = s OR A IS NULL OR s IS NULL] S). 
+                    1.   If S = {} then p is TRUE.                                      This will then get mapped to an antijoin with a predicate that has 
+                    2.   If S = {1} then p is TRUE.                                     disjuctions.  This is a common form in antijoin predicates, and its 
+                    3.   If S = {5} then p is FALSE.                                    efficient execution is considered in section 6.2. 
+                    4.   If S = {NULL, 5} then p is FALSE.                              An alternative to the above is to introduce a new, special aggregate 
+                    5.   If S = {NULL, 1} then p is UNKNOWN.                            that has a Boolean input and it computes universal quantification 
+               Also, NULL NOT IN S is UNKNOWN for any S <> {}.  Case 5 is               with three-valued logic.  This provides a faithful implementation of 
+               particularly counter-intuitive (for database implementers as well as     quantified comparisons in SQL (and a requirement if three-valued 
+               users), but it results from the rules of three-valued logic in SQL:      Boolean results are allowed as parameters to opaque functions).  But 
+               value <cmp> NULL is UNKNOWN; UNKNOWN AND TRUE is                         this aggregate approach limits the set of execution strategies.  Map-
+               UNKNOWN.                                                                 ping to existential tests allows efficient use of index lookups and 
+                                                                                        navigational plans. 
+               This quantified comparison can return values TRUE, FALSE and             4.  REMOVING APPLY 
+               UNKNOWN, and we want to transform it into an existential test,           In the previous section we outline subquery removal, i.e. eliminating 
+               which only returns values TRUE and FALSE.  How can we do this            the use of relational expressions in scalar expressions.  The result is, 
+               mapping?                                                                 in general, a relational expression with Apply operators and param-
+               Utilization context.  We should note that FALSE and UNKNOWN              eterized expressions (PREs).  In many cases, it is possible to do 
+               are undistinguishable for the purpose of selecting rows – i.e. if we     further transformations and eliminate the use of Apply and parame-
+               filter rows on predicate p, then we discard any rows for which p is      terization.  This is commonly known as a decorrelated form of the 
+               either FALSE or UNKNOWN.  FALSE and UNKNOWN are also                     query and it enables the use of a choice of join algorithms.  It was 
+               undistinguishable in the predicate of conditional CASE WHEN              the main intuition behind efficient subquery processing in the first 
+               expressions.                                                             papers on the subject, e.g., [3]. 
+               Also, suppose you have a Boolean expression P(X1, X2, …) = Y,            We don’t view the decorrelated form of subqueries as a preferable 
+               using only logical connectives AND and OR.  The impact of chang-         execution strategy, but rather as a useful normal form.  Different 
+               ing the value of any Xi from UNKNOWN to FALSE, is either Y               surface formulations can end up in the same normal form, including 
+               remains unchanged, or else Y changes from UNKNOWN to                     queries originally written with or without subqueries.  Starting from 
+               FALSE.                                                                   this normal form, cost-based optimization will consider multiple 
+               From the above, it is valid to change the result of quantified com-      execution strategies, including different evaluation orders and (re-
+               parisons from three-valued to two-valued, for Boolean expressions        )introduction of Apply. 
+               used to filter rows or in CASE WHEN.                                     4.1  Categories for Apply Removal 
+               The mapping.  To compute universal quantification we use anti-           Apply (without pass-through, which implement conditional execu-
+               join, which evaluates a NOT EXISTS predicate.  We map through            tion and is foreign to relational algebra) does not add expressive 
+               the conventional equation:                                               power to the five basic relational operators (select, project, cross 
+                      (FOR ALL s                                                        product, union, difference) [9, 13].  However, it does add concise-
+                                   ∈ S: p) = (NOT EXISTS s ∈ S: NOT p)                  ness.  Removing Apply from some relational expression E may yield 
+                                                                                        an expression E’ that is exponentially larger than E.  This is an im-
+                                                                                   997
+                
+               portant distinction for the three subquery removal categories pre-       •    The simplified operator tree goes into cost-based optimization, 
+               sented in [9].  We briefly review those categories here and add a             where an execution plan is selected based on available access 
+               fourth:                                                                       paths, data volume and distribution. 
+               1.   Apply removal that preserves the size of the expression.            Query simplification / normalization is done using the same infra-
+                    For example, the Apply expression from the example query in         structure of tree transformations, so it is possible to utilize a particu-
+                    Section 2 can be rewritten as:                                      lar tree transformation either as simplification or as a cost-based 
+                    ORDERS Apply  (σ[C_CUSTKEY = O_CUSTKEY] CUS-                        alternative. 
+                                    OJ
+                    TOMER) = ORDERS OJ [C_CUSTKEY = O_CUSTKEY]                          For expressions that fall in categories 3 and 4 above, Apply cannot 
+                    CUSTOMER                                                            be removed.  There is basically a single physical execution strategy 
+               2.   Apply removal that duplicates subexpressions.  The size of          for the logical Apply operator: Use nested loops joins to repeatedly 
+                    an expression can be increased exponentially as a result of Ap-     execute the parameterized expression, in a straightforward imple-
+                    ply removal, in particular when dealing with parameterized un-      mentation of the Apply definition.  SQL Server considers a number 
+                    ion and difference. For example, the following expression can       of optimizations on these parameterized nested loops, which are 
+                    result from the use of subqueries in disjunctions, and its decor-   discussed later in this paper. 
+                    related form duplicates R:                                          For expressions that fall in category 1, the query is normalized to 
+                                 R Apply  (σ        S) UA σ         T)                  the decorrelated form, which is fed to the cost-based optimization.  
+                                        JN   R.a = S.a      R.b = T.b                   This process considers a number of logical execution orders and 
+                                  = R JN         S UA R JN         T 
+                                         R.a = S.a         R.b = T.b                    implementation algorithms off of this decorrelated form.  Going 
+                    One could also write the above as a join with a complex OR          through a normal form provides syntax independence to our optimi-
+                    condition, on top of a union of S and T with a column that tags     zation process.  There are many cases of subqueries that can also be 
+                    the source of each union output row, thus preserving the size of    written naturally without those in SQL, and the query optimizer has 
+                    the original expression.  However, we find little use in such       the same behavior for both forms.  For example, it is easy to see that 
+                    representation from a query processing perspective.                 our example query in Section 2 could have been written using outer-
+                    Note that if the same free variable, say R.a, were used in both     join directly – both the subquery or the outerjoin formulation will 
+                    branches of the union, then the predicate can be factored out to    map to the same normal form. 
+                    remove Apply without duplication.  SQL Server identifies and        Particular optimizations for these decorrelated forms are covered 
+                    handles this case as category 1.  In general, pulling up predi-     later in this paper, but it is worth pointing out here that one of the 
+                    cates with free variables is part of the normalization process      alternatives considered during cost-based optimization is the intro-
+                    that removes Apply for expressions in category 1.                   duction (or re-introduction) of Apply, to target navigation strategies 
+               3.   Apply removal unfeasible due to special scalar-relational           that are very efficient in some cases. 
+                    bridge semantics.  There are two cases here: (1) checking for       For expressions that fall in category 2, we have a tradeoff to make: 
+                    max1row for scalar-valued subqueries and (2) conditional            Remove Apply but duplicate sub-expressions (as in category 1), or 
+                    evaluation using pass-through predicates for CASE WHEN              else keep the original (as in category 3).  We do not normalize to the 
+                    expressions.  SQL Server does not remove Apply for these            decorrelated form in this case for two reasons: (1) The explosion on 
+                    cases.                                                              the size of the expression; (2) the added complication faced when 
+               4.   Opaque functions.  This category was not called out in [9],         re-introducing Apply in cost-based optimization, which now requires 
+                    but it is a distinct case.  Apply is not removed when dealing       common subexpression detection to eliminate the redundancy intro-
+                    with opaque functions like our earlier example of table-valued      duced. 
+                    function CHOP_WORDS:                                                We are still interested in resolving this tradeoff effectively in a cost-
+                     MYTABLE Apply CHOP_WORDS(MYTABLE.COL)                              based way, because there are instances where the decorrelated form 
+                    Table-valued functions written in languages such as C++ are         can perform much more efficiently, even with the duplicate subex-
+                    always opaque.  For functions defined through the SQL lan-          pression.  For this reason, we consider Apply removal for this cate-
+                    guage, we also support inlininig, in which case the function        gory of queries during cost-based optimization, for a number of 
+                    definition simply gets expanded, as a view with parameters.         important special cases.  Further details of this are covered later in 
+                    This brings back the expression to one of the three earlier cate-   this paper. 
+                    gories.                                                             5.  OPTIMIZING SUBQUERIES USING 
+               4.2  Tradeoffs and Query Processing Strategy                             MAGIC SETS 
+               All the categories outlined above are found in practice, and their       In this section we briefly review the “complex query decorrelation” 
+               effective processing requires slightly different approaches.  To de-     approach presented in [8], and reformulate it using our framework, 
+               scribe the differences, we need to take into account the processing      to the best of our understanding. 
+               flow of the optimizer in SQL Server:                                     5.1  The magic set technique 
+               •    The compiler front-end parses the query text and resolves sym-      Magic set optimization in [8] starts out with a presentation of sub-
+                    bolic references.  It produces a tree representation of the state-  queries as functions, as we do in this paper with the Apply operator.  
+                    ment based on logical data operators.                               A key observation is that a function can be represented extension-
+               •    This operator tree is simplified and normalized, including con-     ally as a table, for a finite set of argument values.  This extensional 
+                    tradiction detection and removal of redundant operations.  The      representation has additional columns that hold the argument values 
+                    output is a simplified logical operator tree representing the 
+                    query. 
+                                                                                   998
+                    
+                   for which the function has been pre-computed.  Function application                        subqueries. The paper [11] discusses outer join optimization in de-
+                   then turns into join:                                                                      tail. In this section we will concentrate on semijoins and antijoins. 
+                                         R Apply E(r) = R JN                DS,                               Note that SQL does not expose semijoins and antijoins as language 
+                                                                 R.r=R’.r’                                    constructs. Therefore for SQL, subquery removal is the only way 
+                   assuming that DS stores the result of E(r) for all values of r from R.                     these operators make an appearance in the query tree. 
+                   The table DS is called the “decoupled query.”  To obtain DS, you                           6.1  Reordering semijoins and antijoins 
+                   need to compute the function for enough parameter values:                                  From the reordering perspective, semijoins and antijoin are very 
+                                                DS = R’ Apply E(r’),                                          similar to filters. They can be pushed or pulled through an operator 
+                   where R’ is called the “magic set,” and it consists of (a superset of)                     whenever a filter can be pushed or pulled. E.g. a filter can be pushed 
+                   the set of parameter values to be used from R.  A possible choice is                       through a GroupBy operator whenever the predicate does not use 
+                   R’ =distinct[R.r] R.  Of course, the two equations can be put to-                          the results of the aggregate expressions. Similarly a semijoin or an 
+                   gether and there is no need to explicitly store the value of DS.  The                      antijoin can be pushed through a GroupBy as long as the join predi-
+                   result can be seen as a generalization of the semijoin reduction strat-                    cate does not use the results of the aggregate expression. i.e. 
+                   egy used in distributed systems.                                                                        (G   R) SJ        S = G      (R SJ       S) 
+                                                                                                                             A,F       p(A,S)       A,F       p(A, S)
+                   The intent of [8] is that DS has a decorrelated form, which when                                        (G   R) ASJ         S = G      (R ASJ         S) 
+                   plugged above yields a fully decorrelated expression.  However, this                                      A,F         p(A, S)      A,F         p(A, S)
+                   does not really address decorrelation, in the sense we use in this                         Reordering semijoins and antijoins as though they were filters is a 
+                   paper.  Removing Apply in the original expression is the same alge-                        powerful tool but it still keeps the tables in relation S together as a 
+                   braic problem as removing it in the computation of DS.                                     block. If we want to reorder individual tables of S, we have to be 
+                   5.2  Magic on join / group by scenarios                                                    careful about the number of duplicate rows in the result and the 
+                                                                                                              columns that are visible. An identity which gives us a simple and 
+                   In addition to the general definition of magic set reduction, [8] also                     general solution for this problem is: 
+                   shows a specific strategy that can be very efficient to deal with some                                  R SJ       S = G              (R Join        S) 
+                   Join and GroupBy queries.  It transforms expression A below to an                                            p(R,S)       key(R),Any(R)       p(R, S)
+                   expression M with magic-set reduction:                                                     This transformation converts a semijoin into a join. Reordering of 
+                                                                                                              tables around a join is a well understood problem.  
+                                A: R JN                    G           S 
+                                         p(r,s) and p(r,x)   s,x=agg                                          Here is an example that illustrates the benefits of this ability to 
+                                M: R JN                     (G           R’ JN         S)                     freely reorder tables. Consider the query that tries to find the num-
+                                          r = r’ and p(r,x)    s,x=agg          p(r’,s)                       ber of orders placed on the New Year’s Day in 1995 for which at 
+                   with R’ being the distinct values of R used in the join with S.  There                     least one of the suppliers is in the same country as the customer and 
+                   are at least two other possible expressions to execute A [9]: Call B                       the item was shipped within seven days of the order. The SQL for 
+                   the result of moving up the GroupBy operation above the Join; call                         this query looks something like this: 
+                   C the segmented execution over R, which is possible when R and S                           SELECT COUNT(*) 
+                   are common subexpressions.  Magic set strategy M can be much                               FROM ORDERS 
+                   better than the other alternatives when all the following conditions                       WHERE  O_ORDERDATE = '1995-01-01' 
+                   hold (which is not a very common scenario, in practice):                                         AND EXISTS(SELECT *  
+                   •     Many of the values in R.r do not appear in S.s.  Otherwise, A is                           FROM CUSTOMER, SUPPLIER, LINEITEM 
+                         probably quite effective, as it is not computing unnecessary                          WHERE  
+                         groups.                                                                                L_ORDERKEY = O_ORDERKEY  
+                   •     R.r is a low selectivity column (i.e. there are relatively few                                    AND S_SUPPKEY = L_SUPPKEY  
+                                                                                                                AND C_CUSTKEY = O_CUSTKEY 
+                         distinct values of r in R) and also S.s is a low selectivity col-                                 AND C_NATIONKEY = S_NATIONKEY 
+                         umn. Otherwise, B is probably quite effective, since the early                                    AND L_SHIPDATE BETWEEN '1995-01-01' 
+                         join will filter out any unnecessary rows and no extra work is                                    AND dateadd(dd, 7, '1995-01-01') 
+                         created for the final aggregation.                                                   The EXISTS clause of the subquery is transformed into a semijoin. 
+                   •     R and S are not common subexpressions. Otherwise, strategy                           The transformed query looks like: 
+                         C requires a single pass and can be very efficient.                                  ORDERS SJ (CUSTOMER JN  SUPPLIER JN  LINEITEM) 
+                   From the point of view of our framework, the magic set strategy is                         The inner side of the semijoin contains an inner join of three tables. 
+                   an alternative for queries with Join and GroupBy, and it needs to be                       These three tables cannot be reordered freely with the ORDERS 
+                   considered in a cost-based way along with other choices.                                   table as otherwise the count(*) may see incorrect number of rows. 
+                   As with Apply removal over parameterized unions, magic set reduc-                          We are therefore forced to do one of the following. Either join the 
+                   tion requires the duplication of subexpressions, which introduces                          CUSTOMER, SUPPLIER and LINEITEM table before we join the 
+                   additional complications during optimization.                                              result with ORDERS (if we choose to do the semijoin as a hash or 
+                                                                                                              merge join) or join the three tables for every row of ORDERS that 
+                   6.  OPTIMIZING SEMIJOIN                                                                    qualifies the date predicate (if we choose to do the semijoin as a 
+                   AND ANTIJOIN                                                                               nested loop or an index lookup join). Both these alternatives are 
+                   The process of removing correlation generates trees which contain                          quite slow. Since the predicates on both ORDERS and LINEITEMS 
+                   semijoins, antijoins and outer joins. Optimization of semijoins, anti-                     are quite selective, it is better to join the two tables first and then 
+                   joins and outer joins is therefore an important part of handling                           join the small result with the remaining tables. This is exactly what 
+                                                                                                              converting a semijoin to a join lets us do. 
+                                                                                                        999
+                 
+                This ability to freely reorder tables may tempt us to convert all             that ORDER will get looked up twice, giving us an incorrect count 
+                semijoins to inner joins as a normalization step. The problem is that         of orders. 
+                it creates a GroupBy(distinct) operator for every semijoin that is            The identity to convert semijoins to joins described in the previous 
+                converted. We need to find an optimal place for these GroupBys in             section comes to our rescue. For an inner join it is legal to do look-
+                the final plan. GroupBy placement is not an easy task and can in-             ups in any direction. This is the second benefit of converting semi-
+                crease compilation time dramatically. Therefore converting semi-              joins to inner joins. It gives us the freedom to choose either table as 
+                joins to inner joins as a normalization step may not be a good idea           a lookup table. If the predicate on ORDERS is more selective and 
+                and it is preferable to do this on a case-by-case basis.                      easily solvable we can first find the ORDERS and then look up 
+                The tables from the two sides of an antijoin cannot be mixed this             matching LINEITEMs. If on the other hand if the predicate on 
+                way since there is no simple identity to convert them to inner joins.         LINEITEMs is more selective we can do a reverse lookup. 
+                Converting antijoins to inner joins requires introduction of a sub-           As we discussed earlier, antijoins do not have a corresponding iden-
+                traction since inner joins don’t allow us to do universal quantifica-         tity to convert them to joins and therefore do not yield to reverse 
+                tion. Evaluation of subtraction requires an antijoin on keys taking us        lookups. Even worse, subquery removal sometimes generates anti-
+                back to where we started. Therefore the tables used on the inner side         joins that are hard to do even as regular lookups. The reason for this 
+                of an antijoin are forever separated from the rest of the query and           is NULL semantics in SQL. Consider the query that gets the count 
+                can only be reordered amongst themselves.                                     of all the LINEITEMS that were shipped on a day on which no 
+                6.2  Evaluating semijoins and antijoins                                       order was placed. Assume we have a modified version of TPCH 
+                efficiently                                                                   where the unshipped LINEITEMs are identified with L_SHIPDATE 
+                                                                                              as NULL. 
+                Semijoins and antijoins can be evaluated using all the standard join               SELECT COUNT(*) 
+                implementations viz. nested loop join, hash join, merge join and                   FROM LINEITEM 
+                index lookup join. Nothing special is required when evaluating a                   WHERE L_SHIPDATE != ALL(SELECT O_ORDERDATE 
+                semijoin using any of these join algorithms. Evaluating antijoins as               from ORDERS) 
+                a hash join requires some special considerations. For the antijoin (R         As we saw in Section 2 this generates an antijoin with the predicate 
+                ASJp S), if the relation R is used to build the hash table, we have to        L_SHIPDATE = O_ORDERDATE OR L_SHIPDATE IS NULL. 
+                mark and rescan the hash table to decide which rows to output [14].           (We assume here that O_ORDERDATE cannot be NULL.) If we 
+                Implementing the antijoin (R ASJp S) as nested loop join requires             don’t include the L_SHIPDATE is NULL predicate, we will count 
+                that the relation R be on the outer side.                                     unshipped orders. The reason is that the predicate (L_SHIPDATE = 
+                Evaluating the semijoin (R SJ S) or the antijoin (R ASJ S) by using           O_ORDERDATE) evaluates to unknown for every ORDER when 
+                                               p                          p                   L_SHIPDATE is NULL and an antijoin outputs a row if the predi-
+                the relation R as the source of the lookup in an index-lookup join is         cate does not evaluate to true for any of the rows of the inner rela-
+                also easy. We take a row of relation R and look it up in the index on         tion. 
+                the relation S. For a semijoin, we output the row if the index lookup 
+                yields a matching row. For an antijoin, we output the row if the              The set based join algorithms viz. hash and merge cannot be used 
+                index lookup fails to find a match.                                           for this query, since the predicate for the antijoin is (L_SHIPDATE 
+                Doing index lookups from the relation S into the relation R requires          = O_ORDERDATE OR L_SHIPDATE IS NULL). Hash or merge 
+                a lot more care. Suppose we want to find out the number of urgent             join require at least one conjunct that is a simple equality so that it 
+                orders that had at least one item that was shipped on January 1, 1995         has columns that can be used to hash or sort the relations. Since we 
+                                                                                              are evaluating (LINEITEM ASJ  ORDERS), ORDERS has to be the 
+                but was committed for December 31, 1994.  The query would look                                                 p
+                like:                                                                         lookup table for the reasons mentioned earlier. But it is very hard to 
+                                                                                              do lookups into ORDERS with the predicate (L_SHIPDATE = 
+                Example 6.1:                                                                  O_ORDERDATE OR L_SHIPDATE IS NULL). Therefore the 
+                SELECT COUNT(*)                                                               only choice we are left with is nested loop join. A nested loop join is 
+                FROM ORDERS                                                                   going to be excruciatingly slow given the size of LINEITEMS and 
+                WHERE O_ORDERPRIORITY = '1-URGENT'                                            ORDERS. The solution is to use the identity 
+                AND EXISTS (SELECT *                                                               (R ASJ          S) = ((R ASJ  S) ASJ  S) 
+                      FROM LINEITEM                                                                       (p1 OR p2)            p1       p2
+                      WHERE L_SHIPDATE = '1995-01-01'                                         This gives us one antijoin with the predicate L_SHIPDATE = 
+                           AND L_COMMITDATE = '1994-12-31'                                    O_ORDERDATE which can be implemented either as a set based 
+                  AND L_ORDERKEY = O_ORDERKEY                                                 join or as a lookup join and another antijoin with a predicate only on 
+                 )
+                                                                                              LINEITEMS which can be evaluated without looking at all rows of 
+                The query does a semijoin between urgent ORDERS and LINEI-                    ORDERS. 
+                TEMs shipped on a specific date and committed for a specific date             Quantified comparisons frequently contain inequalities of the form 
+                (ORDERS SJLINEITEM). Since the predicate on LINEITEM is a 
+                                                                                              >ANY, <=ALL etc. Removing correlations for such queries gives 
+                lot more selective than the predicate on ORDERS and can be solved             us expressions of the form (R SJ            S) or (R ASJ            S). 
+                with an index, a natural strategy would be to use an index seek to                                             (R.a .cmp. S.a)         (R.a .cmp. S.a)
+                get the qualifying LINEITEMs and then look them up in the OR-                 Consider the case when .cmp. is one of (<, >, <=, >=). A semijoin or 
+                DERS table using the index on O_ORDERKEY. This of course                      an antijoin with such a predicate cannot use hash joins. It may be 
+                does not work for semijoins. There are multiple LINEITEMs per                 very expensive to implement it using a merge or an index-lookup 
+                ORDER. Therefore if two items in an ORDER shipped on the New                  join if the proper indices do not exist. We may therefore have to 
+                Year’s Day in 1995 but were committed for the New Year’s Eve,                 implement it as a nested loop join. An interesting strategy that can 
+                                                                                              be used to improve performance in this case is to use a max or a min 
+                                                                                        1000
+                         
+                        aggregate on the relation S. e.g. (R SJ                                S) can be transformed                       ducing columns to remove correlation generates a complicated dis-
+                                                                                   (R.a > S.a)
+                        to (R SJ              (G                S)). Here is the intuition behind this trans-                              junction which can neither be used for set based implementations 
+                                    (R.a > x)     Φ,x=min(S.a)                                                                             like hash and merge join, nor for index lookups. Therefore, we will 
+                        formation. (R SJ                     S) outputs a row of R if there is at least one 
+                                                 (R.a > S.a)                                                                               not discuss it further in this paper. 
+                        row of S for which R.a > S.a. But in that case it is enough to check 
+                        if R.a > min(S.a). The min/max aggregate can be calculated once                                                    A more common case, like our example, is when we cannot pull the 
+                        and saved so that the relation S does not have to be scanned multiple                                              correlations above the union-all, but we can remove correlations for 
+                        times. The same strategy works for antijoins.                                                                      some (or maybe all) of the expressions R Apply   E(r). In that case 
+                                                                                                                                                                                                                    SJ     i  i
+                        7.  OPTIMIZING PARAMETERIZED                                                                                       we can use the distributivity of Apply over union-all to transform 
+                                                                                                                                                   R Apply  (E (r ) UA E (r )UA E (r ) …) → 
+                        UNIONS (SUBQUERY DISJUNCTIONS)                                                                                                         SJ    1   1           2   2          3    3
+                                                                                                                                                    (R Apply  E (r )) U (R Apply  E (r ))U (R Apply  E (r )) … 
+                        In the previous section we discussed cases where the semijoin or                                                                         SJ   1   1                     SJ   2   2                   SJ    3   3
+                        antijoin predicate was a disjunction. A more complicated case is                                                   and then remove correlations from individual expressions. Note that 
+                        when the disjunctions of the original query are subqueries.                                                        distributing an Apply   requires that we change a union-all to a dis-
+                                                                                                                                                                           SJ
+                        Consider a query where we try to get a count of LINEITEMs which                                                    tinct-union to avoid the duplicates generated by the multiple occur-
+                        were either shipped after the commit date or were shipped more                                                     rences of R. The advantage of this transformation is that for the sub-
+                        than 90 days after the order date.                                                                                 expressions for which we can remove correlations, all the optimiza-
+                                                                                                                                           tion strategies in our repertoire, like set based implementation, re-
+                        Example 7.1:                                                                                                       verse lookup etc. are available. The disadvantage of course is that 
+                        SELECT COUNT(*)                                                                                                    the relation R gets duplicated many times and therefore has to be 
+                        FROM LINEITEM                                                                                                      either evaluated multiple times or spooled. 
+                        WHERE L_SHIPDATE > L_COMMITDATE                                                                                    The paper [12] suggests an interesting way of avoiding the duplica-
+                                OR EXISTS (SELECT *                                                                                        tion of relation R by using a bypass operator. The query is converted 
+                                        FROM ORDERS                                                                                        into a DAG where the bypass operator dispatches the rows to the 
+                                        WHERE DATEADD(DD, 90, O_ORDERDATE) <                                                               branches of the DAG and a union-all at the top combines them to-
+                                        L_SHIPDATE AND O_ORDERKEY =                                                                        gether again. The bypass operator is nice in its generality, but we 
+                                        L_ORDERKEY)                                                                                        think that there are two issues with it. The first issue relates to query 
+                        As we saw earlier, whenever we have subqueries in a disjunction,                                                   execution engines that use the pull model i.e. each operator asks its 
+                        we end up with a tree of the form                                                                                  child for a row (pulls a row) whenever it needs one. The union-all 
+                                R Apply  (E (r ) UA E (r )UA E (r ) …)                                                                     which combines the rows from the two streams that are created by 
+                                            SJ    1   1           2   2          3   3                                                     the bypass operator cannot be implemented as a pull operator unless 
+                        where r are the correlated columns of R and E are the transformed 
+                                    i                                                            i                                         all but one of its streams is spooled away. Otherwise it has to be 
+                        subqueries. When we try to remove correlations from a tree of this                                                 clairvoyant about which of its child will produce the next row. This 
+                        form, we encounter two possibilities.                                                                              means that in reality it has to spool data and cannot avoid duplica-
+                        7.1  Simple correlation                                                                                            tion. The other issue is that the bypass operator makes reverse look-
+                        The simple correlation case is when we can transform                                                               ups impossible. It blocks the access to the original relation into 
+                                E (r ) UA E (r )UA E (r ) … → σ                           (F  UA F UA F …)                                 which we can do reverse lookups. 
+                                  1   1           2   2          3    3              p(r)    1         2         3                         In case both strategies described in this section, that allow us to 
+                        where the expressions F are free of correlation from R. This is pos-                                               remove correlations from disjuncts, do not work, we can still do 
+                                                             i 
+                        sible if and only if the following two conditions are met: (1) The                                                 some minor optimization. The Apply   operator can be implemented 
+                        correlated predicates in each branch are identical in form except for                                                                                                      SJ
+                                                                                                                                           such that it stops reading its right child as soon as it gets a row back. 
+                        the columns of E that they use. (2) The columns of E that they use 
+                                                   i                                                       i                               This allows us to shortcut evaluation of unnecessary expressions. If 
+                        are such that the ones appearing in the same position in the corre-                                                we reorder the children of the union-all such that either cheaper sub-
+                        lated predicates are mapped to the same resulting column by the                                                    expressions or the sub-expressions that are most likely to return 
+                        union-all. If we manage to do this transformation our expression                                                   rows are evaluated first, we can save the cost of evaluating the ex-
+                        becomes                                                                                                            pensive sub-expressions in many cases. 
+                                R SJ       (F  UA F UA F …) 
+                                       p(r)    1         2        3                                                                        8.  OPTIMIZING GENERAL APPLY  
+                        and we have reduced our problem back to the optimization of semi-                                                  As we discussed earlier there are cases where the correlation cannot 
+                        joins.                                                                                                             be removed and the only option available is to execute the corre-
+                        7.2  Complex correlation                                                                                           lated query as a nested loop join. Even after the correlation is re-
+                        Given the severe restrictions on the predicates in the previous sec-                                               moved, the join predicate may be an inequality which prevents us 
+                        tion, such a transformation is possible only in very few cases. For                                                from using the set based join algorithms like hash and merge. In 
+                        example it does not work for our query because the correlated predi-                                               addition, in some situations it’s more efficient to evaluate the query 
+                        cate on one branch is L_SHIPDATE > L_COMMITDATE while                                                              as a straightforward Apply than in a set-based fashion. In all these 
+                        that on the other branch is DATEADD(DD, 90, O_ORDERDATE)                                                           situations, we can still improve on a naïve nested loop implementa-
+                        < L_SHIPDATE AND O_ORDERKEY = L_ORDERKEY. The                                                                      tion. In fact Microsoft SQL Server utilizes several mechanisms to 
+                        two predicates are not even close in form to each other and the only                                               optimize the IO and throughput of queries with nested loop joins. 
+                        way that they can be pulled above the union-all is by introducing 
+                        new columns to distinguish the two branches. This method of intro-
+                                                                                                                                  1001
+                 
+                8.1  Caching                                                               To improve the efficiency of this query, the query processor uses IO 
+                In many situations, we can efficiently avoid a lot of IO if we cache       prefetching as follows: for each (P_PARTKEY, m) tuple obtained 
+                the results for the inner side of the nested loop operator. If the sub-    for R, an asynchronous prefetch request is issued for the PART-
+                query contains no correlations, e.g. when the query processor suc-         SUPP table to fetch the suppliers for this part into memory immedi-
+                cessfully decorrelates the subquery, then a simple caching mecha-          ately for use by the right subtree of the Apply when it is ready. So in 
+                nism is appropriate and will be chosen if the subquery is complex          a production server with 4 CPU’s and 8 disk controllers, this plan 
+                enough, and the result set small enough, that is worth caching. This       can easily utilize all these resources efficiently to process this query 
+                caching mechanism is applicable and utilized in a wide variety of          by keeping all the disk controllers fetching pages from the PART-
+                plans beyond nested loop joins and will not be discussed here.             SUPP tables (assuming they are not cached before this query) while 
+                If there are correlations, the query processor might also cache the        the CPU’s are processing the rest of the query tree. 
+                results in a temporary index that is keyed on the correlated columns       8.3  Improving locality of reference  
+                (aka “memoize” the results as described in [16], [17]). The query          (Batch Sort) 
+                processor in this case takes into consideration the cost of seeking        Introducing a local (batch) sort operation for better performance is 
+                into this temporary index for each outer reference, as well as the         another mechanism to reduce the IO cost of query processing with 
+                cost of building the index itself. As hinted at in [14], these are com-    nested iterations. With this technique, Microsoft SQL Server locally 
+                plex decisions and need to be decided on a case-by-case basis, but         sorts portions of the outer input of Apply operators (where it feels 
+                this complexity is overcome by the cost-based approach of the Mi-          this will be effective) in order to localize the references in the inner 
+                crosoft SQL Server query optimizer.                                        subtree. This technique has been shown by researches to give sig-
+                8.2  Asynchronous IO (Prefetch)                                            nificant performance gains for nested loop join performance [15], 
+                With modern server IO subsystem, there are often many more disk            and indeed we have observed such performance gains when the 
+                controllers than CPU’s available for query processing. Utilizing           query processor judiciously applies this technique to select queries – 
+                these disk controllers efficiently results in big gains in query proc-     for example, this technique is not applied if the inner side is so small 
+                essing throughput and response time. In order to achieve that, many        that it would fit in memory anyway so it’s not worth the effort of the 
+                database products (including Microsoft SQL Server) issue asyn-             extra sorts. 
+                chronous IO operations while keeping the processing thread busy            Continuing the example above, the query processor would apply 
+                processing other rows.                                                     this technique to the Apply operator as follows: for each set of tu-
+                When implementing an Apply operator, Microsoft SQL Server                  ples (P_PARTKEY, m) obtained from the outer subtree, the query 
+                utilizes this in the following way: whenever a row is obtained from        processor sorts them in ascending order of P_PARTKEY before 
+                the outer input to the Apply, this is used to issue a prefetch request     passing each row to the inner subtree (and before issuing the pre-
+                for the required pages of the corresponding underlying table in the        fetches). This has the advantageous effect that sets of rows within a 
+                subquery so that the row is already in-memory by the time the sub-         page in the PARTSUPP B-tree are read together, reducing random 
+                query is ready to process it. Consider the following example:              IO and the total number of pages accessed. The size of each sorted 
+                Example 8.1:                                                               batch is ramped up dynamically so the query processing starts with 
+                                                                                           small batches that pipeline the first few rows quickly up the query 
+                SELECT S_ACCTBAL, S_NAME, P_PARTKEY, P_MFGR,                               plan, then the size of each batch gets bigger to better improve local-
+                S_ADDRESS, S_PHONE, S_COMMENT                                              ity of reference and sequential IO. 
+                FROM PART, SUPPLIER, PARTSUPP 
+                WHERE P_PARTKEY = PS_PARTKEY                                               9.  SUMMARY OF STRATEGIES 
+                          AND S_SUPPKEY = PS_SUPPKEY                                       This paper has described a large number of strategies that are used 
+                          AND P_SIZE           = 1                                         in SQL Server to efficiently evaluate queries that contain subque-
+                          AND P_TYPE           LIKE '%TIN'                                 ries. Here is a summary of these strategies along with the section 
+                          AND PS_SUPPLYCOST              = (        
+                          SELECT MIN(PS_SUPPLYCOST)                                        number where they are described. In the next section we show ex-
+                          FROM PARTSUPP, SUPPLIER                                          perimental results for some of these techniques. 
+                 WHERE P_PARTKEY = PS_PARTKEY                                              Operator Strategies 
+                                    AND S_SUPPKEY = PS_SUPPKEY)                            Semijoin               Forward-lookup (Section 6.2) 
+                This is a simplified version of Query 2 of TPC-H, which is just                                   Reverse-lookup (Section 6.2) 
+                asking for the suppliers who can supply tin parts of a specific size at                           Set-based evaluation (Section 6.2) 
+                the lowest cost. In this case, because of the restrictive filter on the                           Conversion to inner join (Section 6.1) 
+                PART table, Microsoft SQL Server estimates that it is best to                                     Use of max/min (Section 6.2) 
+                calculate the minimum supply cost for each qualifying part, then use       Antijoin               Forward-lookup (Section 6.2) 
+                the part key to seek into the index for the PARTSUPP and filter the                               Set-based evaluation (Section 6.2) 
+                qualifying rows on the cost. In other words, let                                                  Split antijoin with disjunction (Section 6.2) 
+                    R = G                             (PART JN SUPPLIER JN                                        Use of max/min (Section 6.2) 
+                          P_PARTKEY;m=min(PS_SUPPLYCOST)                                   Join with GroupBy      See [9] 
+                                           PARTSUPP) 
+                SQL Server evaluates:                                                      Apply                  Subqueries in disjunctions. (Section 7) 
+                             R Apply  (σ[R.m = PS_SUPPLYCOST] 
+                                     JN                                                                           Caching the PRE (Section 8.1) 
+                             (Seek                       PARTSUPP))                                               Prefetching the PRE (Section 8.2) 
+                                   R.P_PARTKEY=PS_PARTKEY
+                (The plan for evaluating R is not relevant to this discussion).                                   Sorting the outer relation (Section 8.3) 
+                                                                                     1002
+                 
+                10.  EXPERIMENTAL EVALUATION                                               join was applied directly versus when the optimizer splits the anti-
+                10.1  Experimental Setup                                                   join and does a set-based join (hash join). 
+                The experiments were performed on a Dell 2950 Dual core 2.66 
+                MHz machine with 16 GB RAM running Microsoft Windows 2003 
+                X64 SP1. We used the TPC-H benchmark schema for our experi-
+                ments and populated the database with the TPC-H data at scale 30 
+                GB. We created indexes on the tables as required by the TPC-H 
+                benchmark specification and provided additional indexes to facili-
+                tate all navigational and set-oriented subquery execution strategies 
+                relevant to this paper. 
+                10.2  Execution strategies for semijoin 
+                To compare the different strategies for evaluating semijoins, we 
+                relied on variants of the query in Example 6.1. The variants modi-
+                fied the filter predicates in the query so that their selectivity on the 
+                ORDERS and the LINEITEM tables can yield up to 20 rows (high 
+                selectivity) or up to 2,000,000 rows (low selectivity).                                                                                        
+                The different strategies compared were: forward lookup, reverse            As the figure shows, splitting the antijoin in this case gives a per-
+                lookup and set-based join (viz. hash join). For each strategy, the         formance gain of an order of magnitude and scales much better 
+                response time was measured in milliseconds. Before running these           compared to the straightforward evaluation. 
+                queries we made sure that supporting indexes for all strategies were 
+                present. The above chart plots response times for the strategies and       10.4  Strategies for subquery disjunctions 
+                also indicates which strategy was automatically picked by the SQL          We evaluated the performance of the variants of Example 7.1 when 
+                Server query optimizer.                                                    the optimizer transformed the disjunction as explained in Section 
+                As expected, lookup from the table with the highly selective predi-        7.2 compared with when this transformation was disabled. For this 
+                cate into the other table yields the best performance, while set-based     experiment we varied the percentage of qualifying rows from the 
+                evaluation gives good performance when neither predicate is selec-         LINEITEM table from 20% to 100%. 
+                tive enough to do a small number of lookups.                               We see that in this query splitting the disjuncts gave an 
+                                                                                           improvement of more than an order of magnitude and better scaling 
+                                                                                           performance than the straightforward implementation. 
+                                                                                       
+                Note that the difference in performance between the best alternative 
+                and the second best strategy is dramatic: it is at least one order of 
+                magnitude for the selectivity combinations explored in the above                                                                             
+                figure.                                                                    10.5  Optimizations for general Apply  
+                Another important observation is that no single execution strategy         To evaluate the effect of the two optimizations described for im-
+                provides satisfactory performance across all selectivity combina-          proving the performance of Apply, we ran Example 8.1 using the 
+                tions. Cost-based optimization therefore is required to inspect selec-     reverse lookup strategy. Variants of the query modified the predi-
+                tivity estimates and pick an appropriate strategy for subquery execu-      cate on the LINEITEM table to range from high to low selectivity. 
+                tion. As the results show, Microsoft SQL Server succeeds at this           We compared the response time of straightforward Apply to Apply 
+                task as it consistently chooses the best performing strategy for the       with Prefetch and Batch sort. 
+                selectivity ranges investigated. 
+                10.3  Execution strategies for antijoin  
+                We conducted this series of experiments with variants of Example 
+                6.1. The variants again modified the filter predicates of the query so 
+                that their selectivity on the ORDERS table varies in from 10% of 
+                the rows to 100%. We compared query performance when the anti-
+                                                                                     1003
+                 
+                                                                                         deploy their semi-structured offerings to more challenging applica-
+                                                                                         tion scenarios. 
+                                                                                         12.  REFERENCES 
+                                                                                         [1]  International Organization for Standardization (ISO): Database 
+                                                                                              Language SQL, Document ISO/IEC 9075: 1992.  
+                                                                                         [2]  XQuery 1.0: An XML Query Language, 
+                                                                                              http://www.w3.org/TR/xquery/ 
+                                                                                         [3]  W. Kim. On Optimizing an SQL-like Nested Query. ACM 
+                                                                                              TODS, 7, September 1982. 
+                                                                                         [4]  W. Kießling: On Semantic Reefs and Efficient Processing of 
+                                                                                              Correlation Queries with Aggregates. VLDB 1985: 241-250. 
+                As the figure shows, these optimization techniques yield a signifi-      [5]  R. A. Ganski, H. K. T. Wong: Optimization of Nested SQL 
+                cant performance gain (about 88% reduction in response time).                 Queries Revisited. SIGMOD Conference 1987: 23-33.  
+                                                                                         [6]  G. von Bültzingsloewen: Translating and Optimizing SQL 
+                11.  CONCLUSIONS                                                              Queries Having Aggregates. VLDB 1987: 235-243.  
+                Subqueries are a powerful addition to the SQL language. They fa-         [7]  M. Muralikrishna: Improved Unnesting Algorithms for Join 
+                cilitate query formulation in important application scenarios such as         Aggregate SQL Queries. VLDB 1992: 91-102.  
+                decision support or automatic query formulation by ad-hoc report-        [8]  P. Seshadri, H. Pirahesh, T. Y. C. Leung: Complex Query 
+                ing tools. This paper has explained how Microsoft SQL Server 2005             Decorrelation. ICDE 1996: 450-458 
+                represents subqueries by introducing the Apply operator to its inter-    [9]  C. A. Galindo-Legaria, M. Joshi: Orthogonal Optimization of 
+                nal algebra. We have discussed how Apply is transformed into the              Subqueries and Aggregation. SIGMOD Conference 2001: 571-
+                common join operators such as inner join, outer join, semi-join or            581 
+                anti-join during query decorrelation. The main contribution of the 
+                paper is our detailed discussion of (1) how alternative query plans      [10]  J. Zhou, P. Larson, J. Goldstein, L. Ding: Dynamic Material-
+                for subqueries are generated by equivalence rewrites at the logical           ized Views, to appear in: ICDE 2007. 
+                query optimization level, (2) which different execution strategies       [11] C. A. Galindo-Legaria, A. Rosenthal: Outerjoin Simplification 
+                they can be mapped to at the physical level, and (3) which further            and Reordering for Query Optimization. ACM TODS 22(1): 
+                performance optimizations they lend themselves to. Our experimen-             43-73 (1997) 
+                tal evaluation shows that proper choice of execution strategy from       [12] M. Brantner, N. May, G. Moerkotte: Unnesting Scalar SQL 
+                forward or reverse lookup plans to set-oriented processing is essen-          Queries in the Presence of Disjunction, to appear in: ICDE 
+                tial for satisfactory performance. It turns out that no single strategy       2007. 
+                yields acceptable performance across important selectivity ranges. 
+                Therefore, all aforementioned execution strategies for subqueries        [13] C. A. Galindo-Legaria. Parameterized queries and nesting 
+                need to be available to an industrial-strength query processor and            equivalences. Technical report, Microsoft, 2001. MSR-TR-
+                cost-based optimization is crucial to pick the appropriate alternative.       2000-31. 
+                In the future, we expect to see even increasing interest into the topic  [14] Goetz Graefe: Query Evaluation Techniques for Large Data-
+                of subquery execution as relational database vendors gain more                bases. ACM Comput. Surv. 25(2), 1993: 73-17. 
+                experiences with "nested loop languages" for semi-structured data        [15] David J. DeWitt, Jeffrey F. Naughton, Joseph Burger: Nested 
+                processing such as XQuery. Like Microsoft SQL Server, other ven-              Loops Revisited. PDIS 1993: 230-242.  
+                dors have also chosen to map XQuery to an (extended) relational 
+                algebra inside the database engine. With XQuery's navigational           [16] D. Michie: “Memo” Functions and Machine Learning. Nature 
+                programming paradigm and its existentially quantified semantics for           (218), April 1968: 19-22. 
+                filter predicates, subqueries are a frequent guest in the underlying          Hellerstein, J. M.,Naughton, J. F.: Query execution techniques 
+                relational query algebra. The techniques and strategies for subquery          for caching expensive methods. SIGMOD Conference 1996: 
+                optimization and execution discussed in this paper will help data-            423-434.
+                base vendors achieve competitive performance as their customers 
+                 
+                                                                                   1004

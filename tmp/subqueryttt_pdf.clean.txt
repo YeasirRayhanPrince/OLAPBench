@@ -1,0 +1,915 @@
+  Mark Raasveldt
+  Unnesting Arbitrary Queries
+  Thomas Neumann and Alfons Kemper 
+        What is a subquery?
+ SQL allows for subqueries inside arbitrary 
+   expressions 
+ From a user perspective this is very powerful 
+ e.g. suppose we want to find the student with the 
+   highest score, we can use a subquery: 
+  SELECT name
+  FROM students
+  WHERE score=
+      (SELECT MAX(score) FROM students);
+ This is an an uncorrelated subquery 
+            What is a subquery?
+ We can also use correlated subqueries 
+ In this case, columns from the outer tables are used inside 
+    the subquery 
+ To find the highest scoring students per major, we can use the 
+    following subquery: 
+   SELECT name, major            SELECT name, major
+   FROM students s1              FROM students s1
+   WHERE score=                  WHERE score=
+       (SELECT MAX(score)            subquery(s1.major);
+        FROM students
+        WHERE s1.major=major);
+ This is a correlated subquery (s1.major is used from 
+    inside the subquery) 
+             What is a subquery?
+ Logically, subqueries are executed for every row 
+ Let
+s resolve the previous subqueries with the 
+     following table
+                               name     major     score
+                                Tim       CS        9
+                              Pedro       CS        8
+                               Abe       Math       10
+     
+This is a work of 
+ction. Any resemblance to actual people, living or dead, is purely coincidental.
+         What is a subquery?
+  SELECT MAX(score)
+   name   major  score
+  FROM students         Tim    CS      9
+        =10
+                       Pedro   CS      8
+                        Abe   Math    10
+   SELECT name
+   FROM students
+   WHERE score=
+       (SELECT MAX(score) FROM students);
+         What is a subquery?
+  SELECT MAX(score)
+   name   major  score
+  FROM students         Tim    CS      9
+        =10
+                       Pedro   CS      8
+                        Abe   Math    10
+   SELECT name
+   FROM students
+   WHERE score=
+       (SELECT MAX(score) FROM students);
+         What is a subquery?
+  SELECT MAX(score)
+   name   major  score
+  FROM students         Tim    CS      9
+        =10
+                       Pedro   CS      8
+                        Abe   Math    10
+                                    RESULT
+   SELECT name                        name
+   FROM students                      Abe
+   WHERE score=
+       (SELECT MAX(score) FROM students);
+           What is a subquery?
+ max_score never changes 
+ Uncorrelated subquery: this case is 
+easy
+ Can execute once and keep the result: result 
+    will not change 
+ Now let
+s try the correlated case
+   SELECT name, major         SELECT name, major
+   FROM students s1           FROM students s1
+   WHERE score=               WHERE score=
+       (SELECT MAX(score)         subquery(s1.major);
+        FROM students
+        WHERE s1.major=major);
+           What is a subquery?
+  SELECT MAX(score)        name    major   score
+  FROM students
+  WHERE major='CS'         Tim      CS       9
+         =9                Pedro    CS       8
+                           Abe     Math     10
+   SELECT name, major                RESULT
+   FROM students s1                   name major
+   WHERE score=
+       (SELECT MAX(score)
+        FROM students                  Tim   CS
+        WHERE s1.major=major);
+           What is a subquery?
+  SELECT MAX(score)        name    major   score
+  FROM students
+  WHERE major='CS'         Tim      CS       9
+         =9                Pedro    CS       8
+                           Abe     Math     10
+   SELECT name, major                RESULT
+   FROM students s1                   name major
+   WHERE score=
+       (SELECT MAX(score)
+        FROM students                  Tim   CS
+        WHERE s1.major=major);
+           What is a subquery?
+  SELECT MAX(score)        name    major   score
+  FROM students
+  WHERE major='Math'       Tim      CS       9
+         =10               Pedro    CS       8
+                           Abe     Math     10
+   SELECT name, major                RESULT
+   FROM students s1                   name major
+   WHERE score=                        Tim   CS
+       (SELECT MAX(score)
+        FROM students                  Abe Math
+        WHERE s1.major=major);
+           What is a subquery?
+ max_score changes depending on major of student! 
+ We can no longer simply cache the result 
+ We can run the query once per tuple 
+    
+ But this is extremely inefficient
+   SELECT name, major                RESULT
+   FROM students s1                   name major
+   WHERE score=                        Tim   CS
+       (SELECT MAX(score)
+        FROM students                  Abe Math
+        WHERE s1.major=major);
+         Rule-Based Rewriting
+ Many systems instead use heuristic rewrite rules to 
+   flatten subqueries 
+ Our query can be rewritten into the following query:
+   SELECT s1.name,
+          s1.major
+   FROM students s1,
+     (SELECT major, MAX(score) AS max_score
+      FROM students
+      GROUP BY major) s2
+   WHERE s1.major=s2.major
+     AND score=max_score;
+ Not all subqueries are so easy to rewrite
+       Heuristic Rewrite
+ The result of these heuristic rewrite rules is that 
+   queries that are rewritten execute fast 
+ And queries that are not rewritten execute very slow 
+ Execution time can jump from seconds to hours 
+ Sometimes changing just a small part of the query 
+   can remove ability to rewrite
+         Heuristic Rewrite
+                               SQLite rules for  
+                               
+attening subqueries
+                               Error-prone mess
+                           Imagine Oracle
+s list of rules!
+            Types of subqueries
+                                              INTEGERS
+ Scalar subquery (
+)                           i
+ EXISTS(
+)                                    1
+ i IN(
+)                                      2
+ i=ANY(
+)      Any Comparison:                3
+ i=ALL(
+)       = <> > >= < <=              NULL
+            Types of subqueries
+ Scalar subquery (
+   SELECT i, i + (SELECT MIN(i) FROM integers)
+   FROM integers;
+                       i     Result  
+ 0 values: NULL 
+                      1        2       1 value: the value 
+                                       >1 value: error
+                      2        3               
+Not in SQLite
+                      3        4
+                    NULL     NULL
+             Types of subqueries
+ EXISTS (
+  SELECT i, EXISTS (SELECT * FROM integers WHERE i=i1.i)
+  FROM integers i1;
+                       i      Result  
+ 0 values: FALSE 
+                       1 VERDADEIRO >1 value: TRUE
+                       2 VERDADEIRO
+                       3 VERDADEIRO
+                     NULL    FALSO
+             Types of subqueries
+ i IN (
+  SELECT i, i IN (SELECT * FROM integers WHERE i>1)
+  FROM integers i1;
+                       i      Result  
+ MATCH: TRUE 
+                       1     FALSO      ELSE: FALSE 
+                       2 VERDADEIRO
+                       3 VERDADEIRO
+                     NULL     NULL
+             Types of subqueries
+ i > ANY(
+  SELECT i, i > ANY(SELECT * FROM integers)
+  FROM integers i1;
+                       i      Result  
+ RHS HAS NULL: 
+                       1      NULL    
+ MATCH: TRUE 
+                       2 VERDADEIRO ELSE: NULL 
+                       3 VERDADEIRO
+                     NULL     NULL
+          Types of subqueries
+ i > ANY(
+ SELECT i, i > ANY(SELECT * FROM integers WHERE i IS NOT NULL )
+ FROM integers i1;
+                   i    Result 
+ RHS HAS NO NULL: 
+                   1    FALSO 
+ MATCH: TRUE 
+                   2 VERDADEIROELSE: FALSE 
+                   3 VERDADEIRO
+                 NULL   NULL
+           Types of subqueries
+ i > ANY(
+ SELECT i, i > ANY(SELECT * FROM integers WHERE i > 10)
+ FROM integers i1;
+                    i     Result 
+ RHS IS EMPTY 
+                    1     FALSO 
+ FALSE 
+                    2     FALSO 
+ Even if LHS is 
+                                   NULL! 
+                    3     FALSO
+                  NULL    FALSO
+           Types of subqueries
+ i >= ALL(
+ SELECT i, i >= ALL(SELECT * FROM integers)
+ FROM integers i1;
+                    i     Result 
+ RHS HAS NULL: 
+                    1     FALSO 
+ MATCH: NULL 
+                    2     FALSO    ELSE: FALSE 
+                    3     NULL
+                  NULL    NULL
+           Types of subqueries
+ i >= ALL(
+ SELECT i, i >= ALL(SELECT * FROM integers WHERE i IS NOT NULL)
+ FROM integers i1;
+                    i     Result 
+ RHS HAS NO NULL: 
+                    1     FALSO 
+ MATCH: TRUE 
+                    2     FALSO    ELSE: FALSE 
+                    3 VERDADEIRO
+                  NULL    NULL
+           Types of subqueries
+ i >= ALL(
+ SELECT i, i >= ALL(SELECT * FROM integers WHERE i > 10)
+ FROM integers i1;
+                    i    Result 
+ RHS IS EMPTY: 
+                                
+ ALWAYS TRUE 
+                   1 VERDADEIRO
+                   2 VERDADEIRO
+                   3 VERDADEIRO
+                  NULLVERDADEIRO
+              Types of subqueries
+ Three types of subqueries                       INTEGERS
+ Scalar subquery (
+)                                   i
+ EXISTS(
+)                                            1
+ i=ANY(
+)                                             2
+ i IN(
+)                                              3
+     
+ Rewritten: i = ANY(
+)                            NULL
+ i > ALL(
+     
+ Rewritten: NOT(i 
+ ANY(
+     
+ Element that is >ALL must NOT be 
+ANY entry
+         Flatten uncorrelated subqueries
+ Flatten uncorrelated scalar subquery
+  SELECT i, i + (SELECT i FROM integers WHERE i>10)
+  FROM integers;
+ Push FIRST() aggregate 
+    
+ Returns FIRST value found 
+    
+ NULL if no value found 
+ Combine with CROSS PRODUCT 
+    
+ Guaranteed to have 1 tuple on RHS 
+    
+ Output cardinality always equal to LHS cardinality 
+ Note: like SQLite, we don
+t throw an error on 
+    more >1 row, just use first row
+              Flatten uncorrelated subqueries
+ Flatten uncorrelated scalar subquery              INTEGERS
+   SELECT i, i + (SELECT i FROM integers WHERE i>10)         i
+   FROM integers;
+                                                             1
+                                                             2
+                                                             3
+                                                          NULL
+        
+ Works regardless 
+          of what is in RHS!
+          Flatten uncorrelated subqueries
+ Flatten uncorrelated exists
+   SELECT i, EXISTS (SELECT * FROM integers WHERE i > 10)
+   FROM integers i1;
+ Push LIMIT 1 and COUNT(*) 
+    
+ LIMIT just for efficiency 
+ EXISTS is true when 
+    COUNT(*) > 0
+                   
+ Again, Works 
+                    regardless of RHS
+           Flatten uncorrelated subqueries
+ Flatten uncorrelated ANY
+   SELECT i, i = ANY(SELECT * FROM integers WHERE i IS NOT NULL)
+   FROM integers i1;
+ Use MARK join 
+ I didn
+t come up with the name! 
+ MARK tuples as having a join 
+   partner or not  
+ MARK = TRUE, FALSE, NULL 
+ Output cardinality is always 
+   output cardinality of LHS
+       Flatten correlated subqueries
+ Correlated subqueries are much more challenging 
+ In the uncorrelated case, didn
+t need to consider RHS 
+ Now we have to consider the actual RHS plan! 
+ First we introduce a new join: Dependent Join 
+ Dependent Join executes the RHS once for every 
+   tuple in the LHS 
+ Equivalent to executing subquery once for every 
+    tuple
+           Flatten correlated subqueries
+      SELECT name, major
+      FROM students s1
+      WHERE score=
+          (SELECT MAX(score)
+           FROM students
+           WHERE s1.major=major);
+ Transform into following 
+    query plan: 
+ Note: Does not change 
+    anything from efficiency 
+    standpoint yet!
+     
+ We want to eliminate 
+       dependent join!
+           Flatten correlated subqueries
+ Observation: Only need to execute RHS once for 
+    every unique combination of correlated columns
+  SELECT name, major          name    major   score
+  FROM students s1             Tim     CS       9
+  WHERE score=
+      (SELECT MAX(score)      Pedro    CS       8
+       FROM students
+       WHERE s1.major=major);  Abe    Math      10
+ MAX=9 for major=
+CS' 
+ MAX=10 for major=
+Math' 
+ Only need to execute query 2x, not 3x
+         Flatten correlated subqueries
+ Compute unique 
+   combination of 
+   correlated columns of LHS 
+ Perform the dependent 
+   join on duplicate 
+   eliminated version of LHS
+ Join back with original LHS 
+ Correlated columns as join predicate
+       Flatten correlated subqueries
+ Now we push the dependent join down 
+ Goal: no more correlated columns on the RHS of 
+   dependent_join 
+ At this point we can transform into cross product 
+ The way we push down depends on the type of node 
+   we push it down 
+ Let
+s push down our example query
+       Flatten correlated subqueries
+ First node: AGGREGATE 
+ Push correlated columns into 
+   GROUP BY
+      Flatten correlated subqueries
+ Next up: FILTER 
+ No extra changes necessary
+       Flatten correlated subqueries
+ No more correlated columns 
+   in RHS! 
+ Can turn into cross 
+   product!
+       Flatten correlated subqueries
+ No more correlated columns 
+   in RHS! 
+ Can turn into cross 
+   product!
+      Flatten correlated subqueries
+ FILTER + Cross product 
+ Turn into inner join
+       Flatten correlated subqueries
+ Can eliminate delim_scan 
+  entirely 
+ d.major and major in the 
+  same equivalence set 
+ Replace all occurrences of 
+  d.major with major 
+ Eliminate delim_scan 
+  and join
+       Flatten correlated subqueries
+ We can push down the DEPENDENT JOIN into any 
+  operator 
+ Projection - Add nodes to projection
+       Flatten correlated subqueries
+ We can push down the DEPENDENT JOIN into any 
+  operator 
+ Projection - Add nodes to projection
+       Flatten correlated subqueries
+ We can push down the DEPENDENT JOIN into any 
+  operator 
+ Inner Join 
+ LHS has no correlated: Push into RHS 
+ RHS has no correlated: Push into LHS 
+ ELSE: Push into both and add correlated to join 
+   predicate 
+ Set Operations 
+ Push through both LHS and RHS
+       Flatten correlated subqueries
+ Aggregate: 
+ In the paper: 
+ Push through aggregate 
+   by adding correlated to 
+   the GROUP columns
+       Flatten correlated subqueries
+ Aggregate: 
+ In the paper: 
+ Push through aggregate 
+   by adding correlated to 
+   the GROUP columns
+                           EKSHUALLY
+ This USUALLY works 
+    
+ But not always! 
+ Does not work if there is COUNT(*) with filter
+Also not if there is an expression like e.g. SUM(i) IS NULL
+           EKSHUALLY
+   SELECT                    name    major    score
+     major, 
+   (SELECT COUNT(*)           Tim      CS       9
+      FROM students
+      WHERE s.major=major    Pedro     CS       8
+        AND score=10)
+   FROM students s            Abe     Math     10
+   GROUP BY major;
+      major   count        
+ COUNT(*) of people 
+        CS      0            that received a 10 
+       Math     1            grouped by major
+           EKSHUALLY
+                               No matching join candidate, 
+                               gets replaced by NULL
+                                      
+CS' never makes it 
+                                       into the groups
+                                        major  count
+                                         CS    NULL
+                                        Math     1
+           EKSHUALLY
+                                  CASE replaces NULL with 0
+                                  LEFT OUTER JOIN with DELIM 
+                                  adds 
+CS' back in with NULL 
+                                  for every aggregate
+                                        major  count
+                                         CS      0
+                                        Math     1
+       Flatten correlated subqueries
+ Not discussed in the paper: 
+ Correlated ANY/ALL 
+ Need correlated mark join that keeps COUNT(*) 
+    and has_null for every correlated 
+ Window Functions 
+ Push correlated into PARTITION BY clause of every 
+    window function 
+ TOP-N (ORDER BY +LIMIT/OFFSET) 
+ Push correlated into ORDER BY clause 
+ Use NTH_VALUE aggregate, partitioned by 
+    correlated
+           Binding subqueries
+ What correlated columns should be available in a 
+    subquery? 
+ Subquery is like a function call 
+    
+ Any column that can be passed to a function 
+      should be able to be passed to a subquery
+   SELECT name, major         SELECT name, major
+   FROM students s1           FROM students s1
+   WHERE score=               WHERE score=
+       (SELECT MAX(score)         subquery(s1.major);
+        FROM students
+        WHERE s1.major=major);
+         Binding subqueries
+ SELECT clause 
+ either AGGREGATE/GROUP OR normal columns 
+ This can be ambiguous 
+ WHERE or GROUP BY clause 
+ Normal columns available 
+ HAVING clause 
+ AGGREGATE/GROUP 
+ ORDER BY 
+ Anything that can go in the root of SELECT 
+ LIMIT 
+ No correlation allowed
+              Binding subqueries                         INTEGER
+ How do we bind this query?                               i
+   SELECT (SELECT SUM(i1.i))      RESULT-AGGR                1
+   FROM integers i1;                                         2
+                                        i                3
+   SELECT subquery(SUM(i1.i))               6              NULL
+   FROM integers i1;             RESULT-SCALAR
+   SELECT (SELECT SUM(i1.i))                i
+   FROM integers i1;                        1
+                                        2
+   SELECT subquery(i1.i)                    3
+   FROM integers i1;                     NULL
+              Binding subqueries
+ How do we bind this query?
+   SELECT (SELECT SUM(i1.i))      RESULT
+   FROM integers i1;                         
+PostgreSQL 
+                                  i      
+SQLite
+   SELECT subquery(SUM(i1.i))         6
+   FROM integers i1;              RESULT-
+   SELECT (SELECT SUM(i1.i))           i
+   FROM integers i1;                   1
+                                   2     
+ Hyper
+   SELECT subquery(i1.i)               3
+   FROM integers i1;                 NULL
+                Binding subqueries                      INTEGERS
+ PostgreSQL/SQLite                                      i         j
+    SELECT i, SUM(i1.i),           SUM(i1.i)                1        1
+     (SELECT SUM(i)+SUM(i1.i)      inside                   2        2
+      FROM integers)               subquery
+    FROM integers i1                                        3        3
+    GROUP BY i;                                          NULL NULL
+    
+                                RESULT
+    SELECT i, SUM(i1.i),                  i      SUM SUBQ
+     subquery(SUM(i1.i))                                  UERY
+    FROM integers i1;                    1         1        7
+                                         2         2        8
+                                         3         3        9
+                                       NULL NULL NULL
+                Binding subqueries                      INTEGERS
+ HyPer                                                  i         j
+  SELECT i, SUM(i1.i),             SUM(i1.i)                1        1
+    (SELECT SUM(i)+SUM(i1.i)       inside                   2        2
+     FROM integers)                subquery                 3        3
+  FROM integers i1
+  GROUP BY i;                                            NULL NULL
+                                  RESULT
+  SELECT i, SUM(i1.i),                    i      SUM SUBQ
+    subquery(i1.i)                                        UERY
+  FROM integers i1;                      1         1        10
+  The group i1.i is passed in            2         2        14
+  The value is repeated                  3         3        18
+  for every tuple in the subquery      NULL NULL NULL
+                Binding subqueries                      INTEGERS
+ PostgreSQL/SQLite                                      i         j
+    SELECT i, SUM(i1.i),           SUM(i1.j)                1        1
+     (SELECT SUM(i)+SUM(i1.j)      instead of               2        2
+      FROM integers)               SUM(i1.i)
+    FROM integers i1                                        3        3
+    GROUP BY i;                                          NULL NULL
+    
+                                RESULT
+    SELECT i, SUM(i1.i),                  i      SUM SUBQ
+     subquery(SUM(i1.j))                                  UERY
+    FROM integers i1;                    1         1        7
+                                         2         2        8
+                                         3         3        9
+                                       NULL NULL NULL
+                Binding subqueries                      INTEGERS
+ Hyper                                                  i         j
+    SELECT i, SUM(i1.i),           SUM(i1.j)                1        1
+     (SELECT SUM(i)+SUM(i1.j)      instead of               2        2
+      FROM integers)               SUM(i1.i)
+    FROM integers i1                                        3        3
+    GROUP BY i;                                          NULL NULL
+    
+    SELECT i, SUM(i1.i), 
+     subquery(i1.j)
+    FROM integers i1;
+ Error: i1.j not available after aggregation
+          Binding subqueries           INTEGER
+ This query is valid in PostgreSQL:     i
+  SELECT             WHERE i=MAX(i1.i))    1
+    (SELECT i                              2
+     FROM integers   RESULT                3
+     WHERE i=MAX(i1.i))
+  FROM integers i1;      i               NULL
+                     3
+  SELECT subquery(MAX(i1.i))
+  FROM integers i1;
+ SQLite does not accept this! 
+    
+ Doesn
+t accept aggregates in the WHERE clause, 
+     even if they are correlated 
+ Works in Postgres (and DuckDB)
+              Binding subqueries                         INTEGER
+    SELECT                                                    i
+      (SELECT SUM(i+i1.i)   SUM(i+i1.i)                      1
+       FROM integers)                                        2
+    FROM integers i1;
+    
+                                    RESULT              3
+                                                           NULL
+    SELECT subquery(i1.i)                    i
+    FROM integers i1;                        9
+ The aggregation happens only             12
+   inside the subquery                      15
+ The outer query is not an               NULL
+   aggregation! 
+ So 4 rows are returned
+              Binding subqueries                          INTEGER
+ SUM happens over the subquery                              i
+  SELECT                                                       1
+    SUM((SELECT MIN(i)+i1.i     RESULT                         2
+     FROM integers))
+  FROM integers i1;                 i                          3
+                                 9
+  SELECT SUM(subquery(i1.i))                                 NULL
+  FROM integers i1;
+ If we aggregate inside the subquery this is incorrect
+  SELECT
+    SUM((SELECT MIN(i)+SUM(i1.i)    
+ Nested aggregates  
+     FROM integers))                   not allowed!
+  FROM integers i1;
+  SELECT SUM(subquery(SUM(i1.i)))
+  FROM integers i1;
+            System tests                        INTEGERS
+                                                     i
+ We made many tests for different types of       1
+     subqueries to test our implementation 
+ Attempt to cover many possible bugs/            2
+     problems in subqueries                          3
+ All queries run on INTEGERS table             NULL
+     (4 rows) 
+ Split into uncorrelated and correlated 
+     subqueries 
+  https://github.com/cwida/duckdb/blob/subquery
+atten/test/sql/subquery/test_correlated_subquery.cpp
+  https://github.com/cwida/duckdb/blob/subquery
+atten/test/sql/subquery/test_subquery.cpp
+            System tests                        INTEGERS
+ Ran our testbed on five systems                 i
+     
+ PostgreSQL, SQLite, HyPer, MonetDB,           1
+       DuckDB                                        2
+ Split results into six categories:              3
+     
+ Correct                                     NULL
+     
+ Not Supported 
+     
+ Other Error 
+     
+ Incorrect 
+     
+ Timeout 
+     
+ Crash
+          System tests
+  Uncorrelated Subqueries (68 Queries)
+                       ted  or    ect
+                 ect                    imeoutash
+                 orr              IncorrT    Cr
+                 C   Not SupporOther Err
+   PostgreSQL  68    0     0     0     0    0
+     DuckDB    68    0     0     0     0    0
+      HyPer    58    0     0     10    0    0
+    MonetDB    35    3     9     18    3    0
+     SQLite    30    38    0     0     0    0
+             SQLite does not support ANY/ALL operators
+                System tests
+    
+ HyPer incorrect result:
+          SELECT i,                  RESULT
+          i < ALL                        i     COND
+            (SELECT MAX(i)
+             FROM integers)              1VERDADEIRO
+          FROM integers
+          WHERE                          2VERDADEIRO
+          i < ALL
+            (SELECT MAX(i)            NULL NULL
+             FROM integers);
+                           Tuple passes WHERE even 
+                           though condition is NULL!
+                                              Hyper version 2018.2.3.4419.r28057d64 
+                 System tests
+     
+ MonetDB Timeouts:
+    SELECT i >= ALL                 SELECT i,
+      (SELECT i                            SUM(CASE
+       FROM integers                               WHEN (i >= ALL
+       WHERE i IS NOT NULL) AS k,                          (SELECT i
+           SUM(i)                                           FROM integers
+    FROM integers                                           WHERE i=2))
+    GROUP BY k                                     THEN 1
+    ORDER BY k;                                    ELSE 0
+                                                   END)
+                                    FROM integers
+                                    GROUP BY i
+                                    ORDER BY i;
+     # MonetDB 5 server v11.31.11 "Aug2018-SP1"
+                    System tests
+     
+ MonetDB incorrect result (cardinality error):
+  SELECT i,
+         NULL > ANY(SELECT i FROM integers)
+  FROM integers
+  ORDER BY i;                                           SELECT i,
+          +------+-------+ 
+          | i    | L7    |                                     i <> ALL(SELECT i
+          +======+=======+ 
+          | null | null  |                                                   FROM integers
+          | null | null  | 
+          | null | null  |                                                   WHERE i>10)
+          | null | null  | 
+          |    1 | null  | 
+          |    1 | null  |                              FROM integers
+          |    1 | null  | 
+          |    1 | null  |                              ORDER BY i;
+          |    2 | null  | 
+          |    2 | null  |                               +---+----+ 
+          |    2 | null  |                               | i | L6 | 
+          |    2 | null  |                               +===+====+ 
+          |    3 | null  |                               +---+----+
+          |    3 | null  | 
+          |    3 | null  | 
+          |    3 | null  | 
+          +------+-------+
+                 System tests
+     
+MonetDB incorrect result (columns disappearing, 
+       inconsistencies)
+                                      SELECT i
+        SELECT i,                     FROM integers
+          (SELECT SUM(i))             WHERE 
+        FROM integers;                NOT(i IN (SELECT i FROM integers WHERE i>1));
+             +------+                                     +---+ 
+             | L7   |                                     | i | 
+             +======+                                     +===+ 
+             |    6 |                                     +---+
+             +------+ 
+             1 tuple                  SELECT i
+                                      FROM integers
+                                      WHERE 
+                                      i NOT IN (SELECT i FROM integers WHERE i>1);
+                                                         +------+ 
+                                                         | i    | 
+                                                         +======+ 
+                                                         |    1 | 
+                                                         +------+
+          System tests
+  Correlated Subqueries (114 Queries)
+                    ted      or   ect
+               ect       or            imeoutash
+               orrNot SupporBinder ErrIncorrTCr
+               C             Other Err
+   PostgreSQL 113 1    0    0    0    0   0
+     HyPer   110  0    0    0    2    0   2
+    DuckDB   109  5    0    0    0    0   0
+    SQLite   71   41   1    0    1    0   0
+   MonetDB   36   10   24  16    23   5   0
+                System tests
+    
+ SQLite incorrect result:
+        SELECT i,                RESULT                 CORRECT
+          (SELECT 42+i1.i
+           FROM integers              i     COND             i     COND
+           LIMIT 0)               NULL NULL               NULL NULL
+        FROM integers i1
+        ORDER BY i;                  1        43            1       NULL
+                                     2        44            2       NULL
+                                     3        45            3       NULL
+       Version: 3.24.0 2018-06-04 14:10:15 95fbac39baaab1c3a84fdfc82ccb7f42398b2e92f18a2a57bce1d4a713cbaapl 
+              System tests
+    
+ HyPer incorrect result:
+     SELECT i,               RESULT              CORRECT
+       (SELECT 42+i1.i           i    COND           i     COND
+        FROM integers
+        LIMIT 1)              NULL NULL            NULL NULL
+     FROM integers i1
+     ORDER BY i;                1      NULL          1       43
+                                2        44          2       44
+                                3      NULL          3       45
+         System tests
+ The HyPer killer
+      SELECT
+      i=ANY
+        (SELECT i
+         FROM integers
+         WHERE i=i1.i)
+      FROM integers i1
+      ORDER BY i;
+ Segmentation fault 
+ Not only crashes the database, but also corrupts the data (or 
+   statistics) 
+ Only crashes when table has null values
+         System tests
+ PostgreSQL unsupported: 
+ Full outer join on correlated columns 
+ Works only in HyPer (SQLite does not have FULL OUTER JOIN)
+         SELECT i,
+           (SELECT SUM(s1.i)
+            FROM integers s1
+            FULL OUTER JOIN integers s2 ON s1.i=s2.i
+            OR s1.i=i1.i-1) AS j
+         FROM integers i1
+         ORDER BY i;
+      System tests
+ DuckDB unsupported: 
+ ORDER BY, LIMIT or OFFSET in subquery 
+ FULL OUTER JOIN currently unsupported
+                      System tests
+    
+ MonetDB binder errors:
+       SELECT *
+       FROM integers s1                                    SELECT *
+       INNER JOIN integers s2 ON                           FROM integers s1
+         (SELECT 2*SUM(i)*s1.i                             INNER JOIN integers s2 ON
+          FROM integers)                                     (SELECT s1.i=s2.i)
+                           =                               ORDER BY s1.i;
+         (SELECT SUM(i)*s2.i
+          FROM integers)
+       ORDER BY s1.i;
+     ERROR = !SELECT: no such column 's2.i'            ERROR = !SELECT: no such column 's1.i'
+              System tests
+ MonetDB unexpected errors:
+       SELECT i,                             SELECT i,
+              SUM(i)                                SUM(i1.i)
+       FROM integers i1                      FROM integers i1
+       GROUP BY i                            GROUP BY i
+       HAVING EXISTS                         ORDER BY
+         (SELECT i                             (SELECT SUM(i1.i)
+          FROM integers                         FROM integers);
+          WHERE i>MIN(i1.i))           ERROR = !relational query without result
+       ORDER BY i;
+    ERROR = !Subquery result missing         SELECT i+1,
+                                               (SELECT SUM(i1.i))
+   SELECT i,                                 FROM integers i1;
+     (SELECT s1.i                     ERROR = !Error in optimizer garbageCollector
+      FROM
+        (SELECT *
+         FROM integers
+         WHERE i=i1.i) s1
+      ) AS j
+   FROM integers i1
+   ORDER BY i;
+ ERROR = !SELECT: Duplicate column name 's1.i'
+                    System tests
+                                                    SELECT i,
+    
+ MonetDB timeout                                 (SELECT i
+                                                       FROM integers
+                                                       WHERE i=i1.i
+             SELECT i                                  UNION SELECT i
+             FROM integers i1                          FROM integers
+             ORDER BY                                  WHERE i=i1.i) AS j
+               (SELECT 100-i1.i)                    FROM integers i1
+                                                    ORDER BY i;
+      SELECT SUM(
+                   (SELECT SUM(i)))                         SELECT i,
+      FROM integers;                                          (SELECT i
+                            SELECT i,                          FROM integers
+                              (SELECT i                        WHERE i=i1.i
+                               FROM integers                   UNION SELECT i
+                               WHERE i IS NOT NULL             FROM integers
+                               EXCEPT SELECT i                 WHERE i<>i1.i
+                               FROM integers                   EXCEPT SELECT i
+                               WHERE i<>i1.i) AS j             FROM integers
+                            FROM integers i1                   WHERE i<>i1.i) AS j
+                            WHERE i IS NOT NULL             FROM integers i1
+                            ORDER BY i;                     ORDER BY i;

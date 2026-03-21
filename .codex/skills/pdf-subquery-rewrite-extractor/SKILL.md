@@ -27,6 +27,7 @@ Do not use it for:
    - Prefer `pdftotext -layout <pdf> -`
    - Fallback: `gs -q -dNOPAUSE -dBATCH -sDEVICE=txtwrite -sOutputFile=- <pdf>`
    - Last resort: `strings -n 8 <pdf>`
+   - If the local PDF text is unusable because of image-only pages, font-encoded glyphs, or missing Unicode maps, inspect local PDF metadata to identify the paper (`/Title`, nearby strings, file naming) before using any external fallback.
 3. Search the extracted text for rewrite-heavy terms:
    - `unnest`
    - `decorrel`
@@ -42,6 +43,8 @@ Do not use it for:
    - `intersect`
    - `minus`
 4. Locate example queries and pair the original SQL with the rewritten SQL.
+   - If the local PDF is not directly readable but the paper can be identified confidently, use a verified readable copy of the same paper (official mirror, publisher page, or clearly matching translation/reprint) to recover the SQL examples.
+   - In that fallback path, do not pretend the SQL was extracted verbatim from the local PDF. Record the provenance clearly in `notes`, and use `sql_source=paper_with_whitespace_normalization` or `inferred_normalization` as appropriate.
 5. For each pair, write a structured record using the contract in [output_contract.json](references/output_contract.json).
 6. Map each rewrite to the nearest `query_curriculum` family:
    - `exists` -> `subquery_type=exists`, `stage_id=2_table_semi`, `rule_family=correlated_exists`
@@ -54,7 +57,10 @@ Do not use it for:
    - `generator_fit=exact` for current `query_curriculum/subquery.py` coverage
    - `generator_fit=approximate` for similar but not identical support
    - `generator_fit=future` for unsupported rewrite families
-8. Return the records as JSON only unless the user explicitly asks for prose too.
+8. When the user wants an exported artifact, write the JSON array to a file in the same directory as the source PDF, using the PDF basename as the prefix:
+   - input `subquery_papers/oracle.pdf` -> output `subquery_papers/oracle_subquery_rewrites.json`
+   - input `subquery_papers/sqlserver_01.pdf` -> output `subquery_papers/sqlserver_01_subquery_rewrites.json`
+9. Return the records as JSON only unless the user explicitly asks for prose too.
 
 ## Extraction rules
 
@@ -63,6 +69,7 @@ Do not use it for:
 - If the paper shows only one side of the rewrite, do not invent the missing SQL.
 - If you infer a normalized or canonical form, store it separately in `normalized_before_sql` or `normalized_after_sql` and mark `sql_source=inferred_normalization`.
 - Keep page numbers or page hints whenever available.
+- If you must use a verified external copy of the same paper because the local PDF is unreadable, keep `source_pdf` pointing to the local PDF and explain the external recovery path in `notes`.
 - Capture the reason the rewrite is valid in one tight paragraph in `unnesting_logic`.
 - Record semantic requirements in `semantic_preconditions`, not buried in prose.
 - Prefer paper terminology in `transformation_name`, but map it to repo terminology in `query_curriculum_mapping`.
@@ -84,10 +91,13 @@ Capture the optimizer reason the rewrite is valid and useful, such as:
 - The mapped `subquery_type`, `stage_id`, and `rule_family` are consistent with `query_curriculum/subquery.py`.
 - Unsupported but useful examples are retained with `generator_fit=future`.
 - No missing SQL is hallucinated.
+- Any external fallback copy or translation is only used after the local PDF has been identified and found unreadable, and that fallback is disclosed in `notes`.
 
 ## Output expectations
 
 Default output is a JSON array of records following [output_contract.json](references/output_contract.json).
+
+If the user asks to export the results, save the same JSON payload to `<pdf_dir>/<pdf_basename>_subquery_rewrites.json` and mention that path in the response.
 
 If the user asks for a compact summary too, append a short flat list:
 - rewrite families found

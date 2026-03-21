@@ -1,0 +1,975 @@
+                       Unnesting Arbitrary Queries
+                         ThomasNeumannandAlfonsKemper
+                                         
+                          Technische Universitat Xunchen
+                               Xunich, Germany
+                        neumann@in.tum.de, kemper@in.tum.de
+            Abstraft: SQL-99 allows for nested subqueries at nearly all places within aquery.
+            From auser
+spoint of view, nested queries can greatly simplify the formulation of
+            complexqueries. `owever, nested queries that are correlated with the outer queries
+            frequently lead to dependent joins with nested loops evaluations and thus poor perfor-
+            mance.
+              Existing systems therefore use anumber of heuristics to unnest these queries, i.e.,
+            de-correlate them. These unnesting techniques can greatly speed up query processing,
+            butare usually limited to certain classes of queries. To the best of our knowledge
+            no existing system can de-correlate queries in the general case. We present ageneric
+            approach for unnesting arbitrary queries. As aresult, the de-correlated queries allow
+            for much simpler and much more ef
+cient query evaluation.
+       1Introduftion
+       Subqueries are frequently used in SQL queries to simplify query formulation. Consider
+       for our running examples the following schema:
+          
+ students: {[id, name, major,year,...]}
+          
+ exams: {[sid, course, curriculum, date, ...]}
+       Then the following is anested query to 
+nd for each student the best exams waccording to
+       the German grading system where lower numbers are better):
+          QpA smlmqt sFnammumFqoursm
+              from   studmnts sumxams m
+              whmrm sFidnmFsid and
+                     mFkradmn(smlmqt min(m?Fkradm)
+                              from mxams m?
+                              whmrm sFidnm?Fsid)
+       Conceptually,for each student, exam pair 2s3e:it determines, in the subquery,whether or
+       not this particular exam e has the best grade of all exams of this particular student s.
+       From aperformance point of viewthe query is not so nice, as the subquery has to be re-
+       evaluated for every student, exam pair.From atechnical perspective the query contains a
+                                    7B7
+       dependent join,i.e., anested loop join where the evaluation of the right hand side depends
+       onthecurrent value of the left-hand side. These joins are highly inef
+cient, and lead to wat
+       least) quadratic execution time.
+       Database management systems wDBXSs) therefore internally rewrite the query to elimi-
+       nate the correlation. ASQL representation of this rewrite would look likethis:
+          Qp
+A smlmqt sFnammumFqoursm
+               from   studmnts sumxams mu
+                      (smlmqt m?Fsid as idu min(m?Fkradm) as bmst
+                       from mxams m?
+                       kroup by m?Fsid) m
+               whmrm sFidnmFsid and mFidnsFid and
+                      mFkradmnmFbmst
+       `ere,theevaluationofthesubquerynolongerdependsonthevaluesofs,andthusregular
+       joins can be used. This kind of unnesting is very important for good query performance,
+       butexisting techniques cannot handle arbitrary queries. Forexample the subsequent SQL
+       queryisveryhardtode-correlate. ItdeterminestheexamsthataCSorGamesEngineering
+       student should repeat in the future because he or she underachievedincomparison to the
+       average grade of exams taken by him/her or taken by elder peers:
+          Q?A
+          smlmqt sFnammu mFqoursm
+          from   studmnts su mxams m
+          whmrm sFidnmFsid and
+            (sFmajor n
+ or sFmajor n
+Gamms Enk
+) and
+            mFkradm>n(smlmqt avk(m?Fkradm)+p 33onm kradm worsm
+                      from mxams m?           33than thm avmrakm kradm
+                      whmrm sFidnm?Fsid or    33of mxams takmn by
+                            (m?FqurriqulumnsFmajor and 33him/hmr or takmn
+                            sFymar>m?Fdatm))            33by mldmr pmmrs
+       To the best of our knowledge, no existing system can unnest such aquery.And indeed,
+       unnesting this query is hard: Standard unnesting techniques rely upon the fact that at-
+       tributes available within the query can be used to substitute the free variables determined
+       bythe outer query.This is not the case here, sFymar for example cannot be substituted.
+       So clearly this kind of complicated correlated query will be more expensive to evaluate
+       than amore simple subquery.`owever,aswewill show, it is indeed possible to unnest
+       even this query.Wewill have to spend extra effort to derive the value of sFymar and
+       sFmajor,but we can do so without adependent join. And the extra effort we will have
+       to spend is bound by the cost of the dependent join. Xost queries will be dramatically
+       moreef
+cientinthedecorrelatedform,intheworstcasewewillhavethesomejoineffort.
+       That is, our unnesting approach will de
+nitely not incur higher costs than the straight-
+       forward nested loops evaluation 
+and in the majority of cases improve the performance
+       dramatically,often by several orders of magnitude. Furthermore, even the worst case is
+                                    7B>
+        mostlikely awin, as eliminating dependent joins allows for more ef
+cient join implemen-
+        tations. Our contribution can thus be seen as auniversally applicable technique for unnest-
+        ing anykind of nested subquery 
+incontrast to the special case treatments published and
+        implemented so far. The universal unnesting technique has been fully implemented in
+        our main-memory database system `yPer [KN11] and can be experienced via our web
+        interface hypmr3dbFdm that visualizes the resulting query plans.
+        And the typical performance gains of query unnesting are immense: Depending on the
+        query,itreplaces an O2nB: algorithm wnested loop join) with an O2n: algorithm whash
+        join, joining keys). Furthermore the dependent side is executed for every outer tuple in
+        the nested case, butonly once in the unnested case. On large data sets it is easy to get a
+        factor 10 or even 100 performance improvement by unnesting, which makes unnesting an
+        essential technique for query compilation. There are afew cases where nested evaluation
+        is actually bene
+cial, in particular if the outer side is very small and the inner side can be
+        evaluated using an indexlookup, butthat should be triggered by aconscious decision of
+        the query optimizer,not by the waythe query is formulated. By default, queries should be
+        unnested completely.
+        Therest of this paper is structured as follows: We 
+rst de
+ne the notation used in this pa-
+        per in Section 2. Then, in Section 3the algebraic unnesting transformations are speci
+        Section 4covers further optimisation rules that are applicable in special cases we.g., when
+        functional dependencies can be inferred). Section 5isdevoted to a
+cursory
+ performance
+        evaluation that analyses some other well-known DBXSs to our `yPer system which in-
+        corporates the unnesting described. Finally,wesurvey the related work and conclude the
+        paper.
+        =Preliminaries
+        Before looking at the unnesting techniques, we brie
+y repeat some de
+nitions for rela-
+        tional algebra, as the notation is not standardized beyond the basic operators.
+        First, we have the regular (inner) join,which is simply de
+ned as cross product followed
+        byaselection:
+           T B T    := 
+ 2T AT :.
+            1  p  B      p  1   B
+        It computes the combination of all matching entries from T1 and TB.Itisused in most
+        SQL queries, butits de
+nition is not suf
+cient in the presence of correlated subqueries.
+        The subquery has to be evaluated for every tuple of the outer query,therefore we de
+        the dependent join as
+           T C T    := {t 
+t |t 
+T 2t :
+p2t 
+t :}.
+            1  p  B       1  B 1   1   B   B 1     1  B
+                                        7B5
+          `ere, the right hand side is evaluated for every tuple of theleft hand side. We denote
+          the attributes produced by an expression T by A2T:,and free variables occurring in an
+          expression T by F2T:.Toevaluate the dependent join, F2T : 
+A2T:must hold, i.e.,
+                                                                  B        1
+          the attributes required by TB must be produced by T1.
+          Note that in this paper we sometimes explicitly mention natural join in the join predicate
+          to simplify the notation. We assume that all relations occuring in aquery will have unique
+          attribute names, even if theyreference the same physical table, thus K B I 
+ K A I.
+          `owever, if we explicitly reference the same relation name twice, and call for the natu-
+          ral join, then the attribute columns with the same name are compared, and the duplicate
+          columns are projected out. Consider,for example:
+                                  2KBC:Bp
+naturaljoinC 2I BC:
+          `ere, the top-most join checks both the predicate p and compares the columns of C that
+          comefrombothsideswandeliminates one of the twocopies of C
+s columns).
+          ForsemijoinswN),antijoinswT),andouterjoinswE,K)wede
+nethedependentvariants
+          accordinglywO3U3F3L),againtheright-handsideisevaluatedforeverytupleoftheleft-
+          hand side.
+          Besides the join operators, we have the group by operator as additional important operator
+              
+     2e::={x
+2a:f2y::|x
+ 2e:
+y={z|z 
+K:x.a=z.a}}
+               B;aEf                              B
+          It groups its input e wi.e., abase relation or arelation computed from another algebra
+          expression) by K,and evaluates one wor more comma separated) aggregation functionws)
+          to compute aggregated attributes. If K is empty,just one aggregation tuple is produced 
+          as in SQL with amissing group by-clause.
+          We can evaluate functions wand thus construct newattributes) by evaluating the map oper-
+          ator
+              
+aEf2e::={x
+2a:f2x::|x
+          Besidesthese, we need the regular relational algebra operators w
+3\). Using
+          these operators, we can translate SQL queries into relational algebra.
+          In the following we will often have to compare sets of attributes. As ashorthand notation,
+          wede
+netheattribute comparison operator =B as
+              t1 =B tB  := 
+B : t1.a = tB.a.
+          Notethatunlessindicatedotherwisethisoperatorhasissemantics, i.e., it compares NULL
+          values as equal.
+                                                 7B6
+            3Unnesting
+            The algebraic representation of aquery with correlated subqueries winitially) results in a
+            dependent join, i.e., an expression of the form
+                                                      T1 Cp TB.
+            As already mentioned, these dependent joins are very unfortunate from aperformance
+            perspective,and we want to eliminate them. Fundamentally,wemanipulate the algebraic
+            expression until the right hand side no longer depends on the left hand side, and thus
+            the dependent join can be transformed into aregular join. We achieve this using two
+            techniques that we will discuss in the following. First, we try a simple unnesting, that
+            handles cases where dependencies are created just for syntactic reasons. If that is not
+            suf
+cient to unnest the query,weuse the general unnesting framework that can handle
+            arbitrary complexqueries.
+            3A1   Simple Unnesting
+            Sometimesqueriescontaincorrelatedsubqueriesjustbecausetheyaresimplertoformulate
+            in SQL. An example for that is TPC-` Query 21, which contains aconstruct similar to the
+            fragment
+                smlmqt FFF
+                from       linmitmm lp FFF
+                whmrm mxists (smlmqt *
+                                        from linmitmm l?
+                                        whmrm l?Fl_ordmrkmy nlpFl_ordmrkmy)
+                FFF
+            This is translated into an algebra expression of the form
+                                             l1 O 2
+l1.okeyIl2.okey2lB::
+            It is easy to see that this fragment can be unnested by moving the dependent predicate up
+            the tree, transforming the dependent join into aregular join:
+                                               l  N                 2l :
+                                                1   l1.okeyIl2.okey   B
+            Ingeneralthesimpleunnestingphasemovesalldependentpredicatesupthealgebratreeas
+            faraspossible, potentially beyond joins, selections, group by,etc., until it reaches apoint
+            where all its attributes are available from the input. If this happens the dependent join can
+            be transformed into aregular join, as shown by the equivalence explained above.Note
+            that this predicate pull-up happens purely for decorreleation reasons. Further optimization
+            steps might push wparts of) the predicate back down again to 
+lter tuples early on.
+                                                          7B7
+           3A=   General Unnesting
+           Predicate movement is very easy to implement and already suf
+cient to handle frequently
+           occuring simply nested queries. Therefore we try it 
+rst, butfor the general case we need
+           amorecomplexapproach: First, we translate the dependent join into a
+nicer
+ dependent
+           join wi.e., one that is easier to manipulate), and second, we will push the newdependent
+           join down into the query until we can transform it into aregular join.
+           Thus, in the 
+rst step, we use the following equivalence
+                T1 Cp TB     
+ T1Bp
+T1I           D2ECTB:
+                                             A(D)
+           where E := 
+F7T2)
+A7T1)2T1:.
+           At a
+rst glance this transformation did not improve the query plan much, as we have
+           replaced one dependent join by aregular join and another dependent join. `owever, at
+           asecond glance this transformation is very helpful: In the original expression, we had
+           to evaluate TB for every tuple of T1,which could be millions. Therefore, in the second
+           expression, we 
+rst compute the domain E of all variable bindings, evaluate TB only once
+           for every distinct variable binding, and then use aregular join to match the results to the
+           original T1 value. If there are alot of duplicates, this already greatly reduces the number
+           of invocations of TB.
+           This bene
+t can be illustrated by considering our 
+rst example query for determining the
+           best examws) for every student. The straightforward evaluation computes the student
+sbest
+           grade for every exam he or she has ever taken, i.e.:
+                                 
+e.gradeIm22students s Bs.idIe.sid exams e: C
+                                   2
+;mEmin7eB.grade)2
+s.idIeB.sid exams e2:::
+           The equivalence rule allows to restrict the computation of the best grades to each student
+           
+instead of computing it redundantly for each wstudent, exam)-pair.Thus, the dependent
+           join is executed on the projection of the students
+ id only,i.e.:
+                                 ...
+         22students s B             examse:C
+                                      d.idEs.id               s.idIe.sid
+                                   2
+                   2
+d.idIeB.sid exams e2:::
+                                      
+;mEmin7eB.grade)
+           The application of the 
+Push-Down
+-rule for our example query is shown in Figure 1
+           where the entire query evaluation plan is graphically depicted. In away,this constitutes
+           aside-ways information passing from the outer wleft) join argument to the inner wright)
+           argument in order to eliminate redundancyinthe evaluation. Therefore, it is important
+           to implement theprojection in the true, duplicate-eliminating semantics and not in the
+           duplicate-preserving multi-set semantics of SQL.
+           Even more importantly,wehavetransformed agenericdependent join into adependent
+           join of a set wi.e., arelation without duplicates). Knowing that E contains no duplicates
+                                                         7BB
+                                                                            
+e.gradeIm
+                             
+e.gradeIm                                      B
+                                                                               s.idId.id
+                                   C                                                       C
+                    B              
+                       
+                  
+             
+;mEmin7eB.grade)
+                      s.idIe.sid     
+;mEmin7eB.grade)                          d.idEs.id
+                           examse 
+                                B                            
+               students s                s.idIeB.sid                 s.idIe.sid                   d.idIeB.sid
+                                        examse2              students s exams e                  examse2
+                             Figure 1: Example Application of Dependent Join 
+Push-Down
+            helps in moving the dependent join further down into the query.Inthe following we will
+            assume that anyrelation named E is duplicate free, and in the following equivalences we
+            only consider dependent joins where the left hand side is aset. `owever, we emphasize
+            that this optimization technique for nested queries does preservethe SQL multi-set seman-
+            tics. All duplicates 
+contained in the base relations as well as generated by the query 
+            are retained in the optimized plans; only the set E that constrains the evaluation work of
+            the nested subquery is duplicate free. If duplicates are to be removedwbecause of adistinct
+            clause in the query) we can further exploit this by pushing duplicate elimination down into
+            the query evaluation plan.
+            Theultimategoalofourdependentjoinpush-downistoreachastatewheretherighthand
+            side no longer depends on the left hand side, i.e.,
+                 ECT 
+ EBT if F2T:
+A2E:=
+            In this case we still have to perform ajoin, butatleast we can perform aregular join
+            instead of the highly inef
+cient dependent join. And, as we will see, we can always reach
+            this state. An even nicer goal would be to reach astate where the resulting regular join can
+            be substituted by existing attributes, eliminating the join altogether.Wewill discuss that
+            in Section 4.
+            `aving explained the start and the goal of our dependent join push down, we nowlook at
+            individual operators. Forselections, apush-down is very simple:
+                 EC
+p2TB: 
+p2ECTB:.
+            This transformation might look unusual, as we usually want to push selections down, but
+            that is besides the point of our unnesting transformation: We 
+rst push the dependent join
+            down as faraspossible, until it can either be eliminated completely due to substitution,
+            or until it can be transformed into aregular join. Once all dependent joins have been
+            eliminated we can use the regular techniques likeselection push-down and join reordering
+            to re-optimize the transformed query.
+            Pushing adependent join down another join is more complex, as potentially both sides
+                                                           7B9
+                could depend upon the dependent join
+                                                   
+ 2ECT1:BpTB                                                     :   F2TB:
+A2E:=
+                      EC2T B T :
+ T B 2ECT::F2T:
+A2E:=
+                                 1    p    B              1 p                B                                                 1
+                                                   
+ 2ECT:B                                       2ECT ::otherwise.
+                                                                   1 p
+naturaljoin D                         B
+                If the values provided by the dependent join are only required on one side we push it to
+                the corresponding side, otherwise we wave to replicate it in both sides. Note that this
+                push-down rule is overly pessimistic, we can often simplify the parts belowthe join wsee
+                Section 4), butwestick to the basic push-down for now. If we pushed the dependent join
+                to both sides we have to augment the join predicate such that both sides are matched on
+                the E values. Note that the replication is not aperformance penalty relative to the original
+                expression, in both cases T1 and TB are evaluated |E| times.
+                For outer joins we always have to replicate the dependent join if the inner side depends on
+                it, as otherwise we cannot keep track of unmatched tuples from the outer side.
+                      EC2T E T :
+- 2ECT1:EpTB                                                                        :   F2TB:
+A2E:=
+                                 1     p   B            2ECT:E                                     2ECT ::otherwise.
+                                                                   1      p
+natural join D                    B
+                      EC2T1KpTB: 
+ 2ECT1:Kp
+naturaljoinD2ECTB:.
+                Similar for semi join and anti join:
+                                                   - 2ECT :N T                                                     :    F2T :
+A2E:=
+                      EC2T N T :
+                                 1      p    B                                               B
+                                 1    p    B           2ECT:N                                    2ECT ::otherwise.
+                                                                  1 p
+naturaljoin D                          B
+                                                  - 2ECT :T T                                                    :    F2T :
+A2E:=
+                      EC2T T T :
+                                1     p    B                                               B
+                                 1 p B                2ECT:T                                    2ECT ::otherwise.
+                                                                 1 p
+natural join D                        B
+                When pushing the dependent join down a group-by operator,the group-operator must
+                preserveall attributes produces by the dependent join
+                      EC2
+B;aEf2T:: 
+                                     2ECT:
+                                                            B
+A7D);aEf
+                Again, this makes use of the fact that E is aset.
+                Theprojection behavessimilar to the group by operator
+                      EC2
+B2T:: 
+                                2ECT:
+                                                        B
+A7D)
+                Theonlymissing operators are the set operations
+                                                                              79G
+                                      
+e.gradeIm
+                                          C
+                              B             
+                                s.idIe.sid   
+;mEmin7eB.grade)
+                                   examse     
+                           students s          s.idIeB.sid
+                                               examse2
+                                Figure 2: Original Query Q1
+            EC2T1
+TB: 
+ 2ECT1:
+2ECTB:
+            EC2T1
+TB: 
+ 2ECT1:
+2ECTB:
+            EC2T1\TB: 
+ 2ECT1:\2ECTB:
+        Using these transformations, each dependent join is either eliminated at some point by
+        substitution, or ends up in front of abase relation, in which case it can be transformed into
+        anon-dependent join. Thus, the dependent join can be eliminated from anyquery.
+        One potential concern for this approach could be that E might become very large, as it
+        is the set of all variable bindings for the nested subquery.But fortunately that is not the
+        case. Note that, if the original nested join was T C T ,then |E|
+|T|.Thus, if wafter
+                                             1    B            1
+        decorrelating the subquery), the top-most join is ahash-join which stores T1 in ahash
+        table, the memory consumption for that join is at most doubled by computing E.And
+        that is the absolute worst case. If we knowthat the values from T1 are duplicate free,
+        for example because theycontain akey,wecan even avoid materializing E and read the
+        join hash table instead, removing anyoverhead. On the plus side we have transformed
+        an O2nB: operation into an wideally) O2n: operation, which is well worth the memory
+        overhead.
+        3A3  Optimization of Example Query Q1
+        As illustrational example, consider the algebraic translation of Query Q1 in Figure 2. It
+        uses adependent join to compute the nested subquery,and afterwards uses the produced
+        attribute m to check the 
+lter condition.
+        Thesubsequent transformations are shown in Figure 3to7.First, the top-most dependent
+        join is transformed into aregular join plus adependent join with the domain of the free
+                                         79D
+                                  
+e.gradeIm
+                                   B
+                                    s.idId.id
+                                              C
+                                   
+            
+                                    d.idEs.id    
+;mEmin7eB.grade)
+                          B                       
+                            s.idIe.sid             d.idIeB.sid
+                       students s exams e          examse2
+                           Figure 3: Query Q1, Transformation Step 1
+                                     
+e.gradeIm
+                                      B
+                                       s.idId.id
+                                          
+                                           d.id;mEmin7eB.grade)
+                                                 C
+                                          
+      
+d.idIeB.sid
+                                            d.idEs.id
+                             B                    examse2
+                               s.idIe.sid
+                          students s exams e
+                           Figure 4: Query Q1, Transformation Step 2
+                                      
+e.gradeIm
+                                      B
+                                        s.idId.id
+                                          
+                                           d.id;mEmin7eB.grade)
+                                              
+                                               d.idIeB.sid
+                                                 C
+                                           
+       examse2
+                                            d.idEs.id
+                              B
+                               s.idIe.sid
+                          students s exams e
+                           Figure 5: Query Q1, Transformation Step 3
+                                         799
+                                      
+e.gradeIm
+                                      B
+                                        s.idId.id
+                                          
+                                           d.id;mEmin7eB.grade)
+                                              
+                                               d.idIeB.sid
+                                                 B
+                                           
+       examse2
+                                            d.idEs.id
+                              B
+                               s.idIe.sid
+                          students s exams e
+                           Figure l: Query Q1, Transformation Step 4
+                                      
+e.gradeIm
+                                      B
+                                        s.idId.id
+                                          
+                                           d.id;mEmin7eB.grade)
+                                             B
+                                               d.idIeB.sid
+                                           
+       examse2
+                                            d.idEs.id
+                              B
+                               s.idIe.sid
+                          students s exams e
+                Figure 7: Query Q1, Transformation Step 5wpushing selections back down)
+                                         797
+                                      
+e.gradeIm
+                                      B
+                                        s.idId.id
+                                          
+                                           d.id;mEmin7eB.grade)
+                                              
+                                               d.idIeB.sid
+                                              
+d.idEeB.sid
+                                               examse2
+                              B
+                               s.idIe.sid
+                          students s exams e
+                Figure 8: Query Q1, Optional Transformation Step lwdecoupling both sides)
+                                        
+s.name,e.course
+                       Be.grade>m91
+7d.idIs.id
+7d.year>e.date
+e.curriculumId.major))
+                                                          
+                                                           d.id,d.year,d.major;mEavg7eB.grade)
+                                                   Bd.idIeB.sid
+7d.year>eB.date
+eB.curriculumI
+                                                
+                            examse2
+                                                 d.idEs.id,d.yearEs.year,d.majorEs.major
+                  B
+                    s.idIe.sid
+         
+                   examse
+          s.majorI...
+          students s
+                 Figure 9: Query Q2, Optimized Form with Sideways Information Passing
+                                         79>
+          variables. In the next step the dependent join is pushed down the group by operator,
+          extending the aggregation attributes as needed. Afterwards, the dependent join is pushed
+          down the selection, ending up in front of atable scan. Nowwecan transform it into
+          aregular join, as the right hand side is not dependent on the left hand side. Subsequent
+          optimizationswillpushthepredicatesdownagain,introducingaregularjoin,whichresults
+          in the plan shown in Figure 7.
+          In manycases, and also in this example, it is possible to eliminate the join with the domain
+          Ealtogether: If all attributes of the domain are wequi-)joined with existing attributes, we
+          can instead derive the domain from the existing attributes. In this example, we knowthat
+          d.id = e2.sid holds after the join, therefore we can replace this by amap operator that
+          substitutes d.id with e2.sid,asshown in Figure 8. The nice thing about this substitution
+          is that the parts of the query are completely independent, no trace of the original nesting
+          remains. `owever, substitutioncreatesasupersetoftheoriginaltuples! Atleastingeneral,
+          in this example referential integrity will most likely prevent that. But in general dropping
+          the join with the domain and substituting instead can lead to larger intermediate results, as
+          the 
+lter effect of the join is removed, too. This does not affect the 
+nal result, because the
+          
+lter will still happen at alater stage wat the original dependent join), butitcan affect the
+          query runtime. Therefore removing the join is adecision that has to be made by the query
+          optimizer wsee Section 4).
+          Note that some care is needed when trying to remove 
+d.idIeB.sid after substitution.It
+          wouldbetemptingtosimplydropthisselection, as d.id is derivedfrom e2.sid.But this is
+          only safe if e2.sid is not nullable. If e2.sid can assume NULL values, then the selection
+          must be preserved wand in fact is simply anot-NULL check).
+          3A4   Optimization of Example Query Q=
+          Forour motivational query Q2 we illustrate the resulting plan in Figure 9. Note that here
+          Ecannot be eliminated, as there is anon-equi join with values from E,which prevents
+          substitution. `ere, decoupling the nested subquery evaluation is not possible because the
+          value of s.year is notequi-joinded with e2.date.Therefore, the domain of the outer query
+          has to be transferred sideways to the nested query evaluation. `owever, note that all de-
+          pendent joins have disappeared and were replaced by ef
+cient regular algebraic operators.
+          3A5   Anti1Join Example
+          Let us discuss an example of adependent anti-join which is used for transforming queries
+          that useanSQL all-clause to compare avalue against all values derivedbyawpossibly
+          correlated) subquery.Such aquery is formulated belowfor twoabstract relations R :
+          {[K3...3X3...]} and S : {[I3...3Y3...]}.
+                                                    795
+              Q3A    smlmqt RF
+                                  *
+                     from      R
+                     whmrm RFX nall (smlmqt SFY
+                                               from S
+                                               whmrm SFB nRFA)
+          Obviously,itisnot possible to translate this query into adependent join; butitispossible
+          to negate the predicate and use adependent anti-join as shown on the left hand side of
+          the subsequent 
+gure. In the course of the unnesting optimization the dependent anti-join
+          can be transformed into a
+normal
+ anti-join. The resulting query plan is shown on the
+          right-hand side of the subsequent 
+gure.
+                              U                    
+             T
+                               X4IY                               7X4IY)
+7S.BIR.B)
+                      R               
+S.BIR.B
+                                          S               R                   S
+          4Optimizations
+          When simple unnesting is successful, it completely eliminates anyhint of correlations
+          from the query.That is, the resulting algebra expression looks as if the query had been
+          formulated without correlated subqueries. The general unnesting case howeverhas to add
+          the projection to compute the domain E,and the join with E,which causes some extra
+          costs. Of course computing E is usually still much preferable to anested evaluation, as the
+          computation of E and the join with E cause one-time costs, while anested evaluation re-
+          sults in quadratic runtime. But still, eliminating E completely is tempting, and sometimes
+          possible, as seen in the previous example query Q1 wcf. Figure 8).
+          In general, we can eliminate E,ifwecan substitute it with values that already exist in
+          the subtree anyway.This is commonly the case with equi-joins, for example the query
+          contains the expression E B         R,wecanlearn the possible values of E.a that can
+                                     D.aIR.b
+          makeittothe original dependent join by inspecting the values of R.b.The emphasized
+          part of the statement is important, of course E can contain values that do not exist in R,
+          butthese will never
+nd ajoin partner and will thus neverreach the original dependent
+          join. We can therefore ignore them.
+          To decideaboutsubstitutionwemust
+rstanalyzethequerytreeto
+ndequivalenceclasses
+          that are induced by the join and 
+lter conditions. Forexample a
+lter condition 
+          implies that a and b are in the same equivalence class. We knowthat in the 
+nal result a
+          andbhavethesamevalue,wecanthussubstituteawithb.Computingtheseequivalenceis
+          relatively straight forward. One potential cause for problems would be outer joins, which
+          can cause a and b to not be equal in the example above,but as the top-most join on E is
+          knowntobeNULL-rejectingthis is not an issue here.
+                                                   796
+        After having identi
+ed the equivalence classes C,wecan decide about apossible substi-
+        tution as shown below:
+           ECT 
+        2T: if 
+A2T::A2E:
+                     A7D)EB                    C
+        Thus,insteadofjoiningwithE,wecanextendT wusingthemapoperator)andcomputethe
+        implied attribute value from E by using the equivalent attributes. Note that this only holds
+        because E is aset. Note further that substitution might increase the size of intermediate
+        results, the relationship between the twoformulations is not = but 
+.This cardinality
+        increase is caused by losing the wpotential) pruning power of the join with E.Instead of
+        evaluating the formed correlated subtree with every tuple in T that will 
+nd ajoin partner
+        in E,weevaluate with every tuple from T.The tuples that do not have join partners will
+        wonly) be eliminated higher up in the tree, when the original dependent join is executed,
+        butthe intermediate results can be larger.
+        Therefore, substitution only pays offifthe join with E is unselective.InQuery Q1 that
+        will be the case, therefore it is agood idea to use substitution, butingeneral the query
+        optimization has to compare the costs of both alternativesand chose the cheaper one. For
+        selective joins, it is better to keep E and thus eliminate tuples as early as possible.
+        5Evaluation
+        Unnesting correlated subqueries can lead to nearly arbitrary gains, as it can transform an
+        O2nB: into an wideally) O2n: operation. Demonstrating afactor 100 improvement for
+        example would be easy with acarefully constructed query.But the examples and the
+        resulting factors would all be abit arbitrary.Instead, we therefore 
+rst compare the ex-
+        pressiveness of our technique with that of other systems, and then give some performance
+        numbers for TPC-`. All experiments were run on an Intel i7-3930K with l4GB main
+        memory.
+        Wehaveimplementedtheunnestinginour`yPer[KN11]system,andcomparedittoother
+        approaches. First, we studied the unnesting capabilities of several database systems. Out
+        of the commercial systems, SQL Server seems to have the best unnesting engine, which
+        is to be expected based on the publication [GJ01] of the the XS SQL Server team. Un-
+        fortunately the licensing terms for SQL Server 2014 forbid publishing runtime numbers,
+        therefore we will only qualitatively describe the result. We also ran experiments on Post-
+        greSQL 9.1, where we are allowed to publish numbers. As test data for our twoexample
+        queries we generated 1,000 student and 10,000 exam tuples, i.e., 10 exams per student.
+        This is asmall data set, butthe effects of unnesting are so extreme that we did not want
+        to increase the data set size. wRoughly speaking, the gains of our method growquadratic
+        with the size of the relations, so we could demonstrate arbitrary gains by increasing the
+        data set size).
+        Query 1isrelatively simple to unnest. Our `yPer system unnests the query and uses
+        substitution, which result in aruntime of R1ms. Without unnesting the query takes 51ms
+        on`yper.SQLServer2014alsounneststhisquery.Wearenotallowedtoreportruntimes,
+                                     797
+     butthe query plan is reasonable. PostgreSQL howeverwas not able to unnest even this
+     relatively simple case, which results in aruntime of 1,300ms. And this runtime grows
+     very sharply as the data size grows. If, however, the query would have been formulated
+     decorrelated, as formulated as query Q1
+ in the Introduction, then PostgreSQL could have
+     executed it in 17ms. This demonstrates howimportant it is to unnest subqueries.
+     Query2ismoredif
+culttounnest,andwearenotawareofanysystembesidesour`yPer
+     system that is able to unnest it. `yPer can execute that query in 42ms w408ms without
+     unnesting). SQL Server 2014 is not able to unnest this query and generates an execution
+     plan with nested loop joins. We are not allowed to report the runtime, butobviously one
+     cannot expect good runtime in aplan with large nested loop joins. PostgreSQL needs
+     12,099ms for the query,again growing sharply with the data size.
+     The queries in TPC-` are not that dif
+cult to unnest, and all of the large commercial
+     systems are able to unnest them. This is indeed absolutely essential, as shown by the
+     followingperformancenumbersobtainedfromour`yPersystemthatallowsto
+switchon
+     andoff
+theunnesting. EvenatSF =1,theruntimeofQuery4is7mswithunnesting,and
+     157,l1lmswithout. Thisisadifferenceofseveralordersofmagnitude,andhighlightsthat
+     unnesting is absolutely essential. Other queries are affected, too: Forexample Query 17
+     takes 9ms with unnesting, and 4,ll4ms without. Of course every vendor makes sure that
+     the well known TPC-` queries are correctly unnested in their system, butthese numbers
+     highlight that the performance impact is so large, that asystem should be able to unnest
+     arbitrary queries, as proposed in this paper.
+     6RelatedWork
+     The
+rst, seminal paper on optimization of nested subqueries waspublished by WonKim
+     [Kim82]. It provides 
+recipes
+ wi.e., transformation rules) for unnesting particular nested
+     query patterns which were integrated in manycommercial database systems. Agood sur-
+     vey of those techniques wasgiven by Jarkeand Koch [JK84]. Werner Kiessling [Kie85]
+     addressed the correctness problems of some of the suggested transformations when empty
+     sets are encountered. Formany, butnot all, cases he wasable to correctly formulate ef-
+     fective unnesting transformations. Thus unnesting remained an active 
+eld of research, in
+     particular because of the SQL language extensions that orthogonally allowed nested sub-
+     queries in all of the select-from-where-clauses. In the Nineties, Seshadri et al. [SPL9l]
+     formulated complexquery decorrelationa rules. Dayal
+spaper [Day87] focuses on ef
+     ciently evaluating subqueries utilizing outer joins. The outer joins walso extensively used
+     in our transformation rules) can be optimized using transformation/equivalence rules de-
+     veloped by Galindo-Legaria and Rosenthal [GR97].
+     Oracle
+ssubquery optimizations are described by Bellamkonda et. al. [BAW909]. They
+     developed amultitude of subquery optimization techniques, auch as unnesting, group-by
+     merging, commonsubexpression elimination, join predicate pushdown, join factorization,
+     anti-join formulations of set minus and intersection queries, etc. Xanyofthese techniques
+     are appliedaspreprocessingtransformationsinaheuristicspattern-matchingway
+and,as
+                      79B
+       it appears, are particularly tuned for optimizing 
+TPC-`-style
+ queries. In this paper,we
+       developed ageneralized approach that tackles the problem in auniform wayand achieves
+       similar optimization effects as the special-purpose pattern-matching approaches 
+asour
+       
+best of breed
+ TPC-` performance results reveal [LBKN14].
+       The Tandem approach for unnesting queries is described by Celis and Zeller [CZ97]. At
+       about the same time, in the context of the Xicrosoft SL Server,Galindo-Legaria and Joshi
+       [GJ01] introduced the apply-operator,that is similar to our bind join, for 
+algebrizing
+       SQLquerieswithnestedsubqueries. `owever, their work fell short of being able to trans-
+       form all possible nesting patterns: 
+Bchieving optimality and syntax-independence in this
+       class (subqueries that areremoved by introducing additional common subexpressions) re-
+       quires an understanding of the plan space and mechanisms to generate plans of interest,
+       for queries with common subexpressions, whichwebelieve requires additional research
+       We are con
+dent that our paper closes this cited 
+research gap
+. Graefe
+sBTW-paper
+       [Gra03] discusses Xicrosoft SQL Server
+sapproach to evaluate nested queries that could
+       not be unnested 
+which wasneeded when unnesting failed.
+       Aparticular query pattern, i.e., scalar subqueries in the presence of disjunctions, wasopti-
+       mizedbyBrantner,XayandXoerkotte[BXX07]usinganalgebrawithbypassoperators
+       [KXPS94]. Anotherimportantspecialcaseofunnestingqueriesinvolvinglargefacttables
+                           
+       is addressed by Akinde and Bohlen [AB03]. Theyargue that outer joins are too costly in
+       OLAPenvironmentswithverylarge fact tables and, instead, propose ageneralized multi-
+       dimensional join operator GXDJ.
+       In the late Nineties, several groups worked on algebra extension to capture nested sub-
+       queries. Some of the work wasperformed in the context of the object-oriented/object
+       relational models [SAB94] that exhibits data nesting and therefore requires 
+attening and
+       nesting of these structures. One of the 
+rst proposals for such an object query algebra
+       wasformulated by Cluet and Xoerkotte [CX93] and later expanded by Wang, Xaier and
+       Shapiro [WXS99]. Cao and Badia [CB05] proposed the explicit use of nested relations to
+       evaluate nested subqueries.
+       The Virtuoso system [Erl12] tries to address the problem of nested queries at runtime,
+       by evaluating the nested query not once for every outer tuple, butonce batch of outer
+       tuples, similar to ablock-wise nested loop join, greatly reducing the cost of nested eval-
+       uation. During batched execution, each tuple carries a
+set number
+ between operators,
+       maintaining an association between the intermediate results and the vector of inputs of the
+       subquery [Erl14]. While not as powerful as aquery-optimizer based solution, this is much
+       moreef
+cient than the standard nested-loop evaluation of nested queries.
+       Ourside-waysinformationpassingoptimizationtoreducetheamountofworkincurredby
+       evaluatingthenestedsubquerywtree)resemblesthemagicsettransformationsthatwerede-
+                           9
+       scribed by Seshadri et al [S`P 9l] in the context of the IBX DB2 system. Consequently,
+       in our graphics interface wwwwFhypmr3dbFdm)fordisplayingthequeryevaluationplans
+       the corresponding operator is called magic.
+                                   799
+          7Conflusion
+          Xanyproposals for unnesting SQL queries have been published in the past. `owever,
+          so fartheir implementations fell short of comprehensively coverall possible patterns 
+          as becomes evident by surveying the existing wevenrecent) literature on optimizing spe-
+          cial cases. Also, our analyis of commercial and open source database systems revealed
+          that their optimizations only coverspecial patterns that warguably) are the most important
+          use cases for query nesting. In this paper we have developed an algebraic transforma-
+          tion approach that covers all kinds of nested subqueries. The algebraic equivalences allow
+          to completely replace the initially used dependent joins by 
+regular
+ join operators. In
+          order to decrease the extent of the nested query evaluation work, side-ways information
+          passing is employed that restricts the independent subquery evaluation plan to those tu-
+          ple sets that are relevant for the outer query.The approach is fully implemented in our
+          main-memorydatabasesystem`yPerandcanbeexperimentedwithviaourwebinterface
+          wwwFhypmr3dbFdmthat not only displays the running times of interactive queries but
+          also showstheoptimizedqueryevaluationplans. `avingintegratedtheunnestingtransfor-
+          mations into our cost-based optimizer ensures that we are nevertoo eager in, for example,
+          decoupling the inner query from the outer query and thereby incurring higher costs 
+          optimizer will do so only if there is acost bene
+t which in manypractically relevant cases
+          is dramatic.
+          Afknowledgements
+          This work wassupported by the German Research Foundation DFG. We acknowldge the
+          helpful comments of the anonymous BTW-reviewers that helped to improve the paper.
+          Referenfes
+                                                   
+          [AB03]    Xichael O. Akinde and Xichael `. Bohlen. Ef
+cient Computation of Subqueries in
+                    ComplexOLAP. In Umeshwar Dayal, Krithi Ramamritham, and T. X. Vijayaraman,
+                    editors, Proceedings of the 19th International Conference on Data Engineering,March
+                    5-8, 2003, Bangalore, India,pages 1l3
+174. IEEE Computer Society,2003.
+               +                                                                        
+          [BAW 09] SrikanthBellamkonda,Ra
+Ahmed,AndrewWitkowski,AngelaAmor,XohamedZa
+                    andChunChiehLin. EnhancedSubqueryOptimizationsinOracle. PVLDB,2w2):13ll
+                    1377, 2009.
+          [BXX07] XatthiasBrantner,NormanXay,andGuidoXoerkotte. UnnestingScalarSQLQueries
+                    in the Presence of Disjunction. In Proceedings of the 23rdInternational Conference on
+                    Data Engineering,ICDE 2007, The MarmaraHotel, Istanbul, Turkey,Bpril 15-20,
+                    2007,pages 4l
+55, 2007.
+          [CB05]    Bin Cao and Antonio Badia. ANested Relational Approach to Processing SQL Sub-
+                                   
+                    queries. In Fatma Ozcan, editor, Proceedings of the BCMSIGMOD International Con-
+                                                >GG
+                   ference on Management of Data, Baltimore, Maryland, USB, June 14-16, 2005,pages
+                   191
+202. ACX, 2005.
+         [CX93]    Sophie Cluet and Guido Xoerkotte. Nested Queries in Object Bases. In Catriel Beeri,
+                   AtsushiOhori,andDennisShasha,editors,DatabaseProgrammingLanguages(DBPL-
+                   4), Proceedings of the Fourth International Workshop on Database Programming Lan-
+                   guages-Object Models and Languages, Manhattan, NewYork City,USB, 30 Bugust -
+                   1September 1993,Workshops in Computing, pages 22l
+242. Springer,1993.
+                                    
+         [CZ97]    Pedro Celis and `ansjorgZeller.Subquery Elimination: AComplete Unnesting Algo-
+                                                                     
+                   rithm for an Extended Relational Algebra. In W. A. Gray and Per-AkeLarson, editors,
+                   Proceedings of the Thirteenth International Conference on Data Engineering,Bpril
+                   7-11, 1997 Birmingham U.K.,page 321. IEEE Computer Society,1997.
+         [Day87]   Umeshwar Dayal. Of Nests and Trees: AUni
+ed Approach to Processing Queries
+                   That Contain Nested Subqueries, Aggregates, and Quanti
+ers. In Peter X. Stocker,
+                   William Kent, and Peter `ammersley, editors, VLDB
+87, Proceedings of 13th Interna-
+                   tional Conference on Very Large Data Bases, September 1-4, 1987, Brighton, England,
+                   pages 197
+208. XorganKaufmann, 1987.
+         [Erl12]   Orri Erling. Virtuoso, a`ybrid RDBXS/Graph Column Store. IEEE Data Eng.Bull.,
+                   35w1):3
+8, 2012.
+         [Erl14]   Orri Erling. personal communication, 2014.
+                    
+         [GJ01]    Cesar A. Galindo-Legaria and Xilind Joshi. Orthogonal Optimization of Subqueries
+                   and Aggregation. In Sharad Xehrotra and Timos K. Sellis, editors, Proceedings of the
+                   2001BCMSIGMODinternationalconferenceonManagementofdata,SantaBarbara,
+                   CB,USB,May21-24,2001,pages571
+581.ACX,2001.
+                    
+         [GR97]    Cesar A. Galindo-Legaria and Arnon Rosenthal. Outerjoin Simpli
+cation and Reorder-
+                   ing for Query Optimization. BCMTrans. Database Syst.,22w1):43
+73, 1997.
+                                                                            
+         [Gra03]   Goetz Graefe. Executing Nested Queries. In Gerhard Weikum, `arald Schoning, and
+                   Erhard Rahm, editors, BTW 2003, Datenbanksysteme fur Business, Technologie und
+                                                             
+                   Web, Tagungsband der 10. BTW-Konferenz, 26.-28. Februar 2003, Leipzig,volume 2l
+                   of LNI,pages 58
+77. GI, 2003.
+                                   
+         [JK84]    Xatthias Jarkeand Jurgen Koch. Query Optimization in Database Systems. BCM
+                   Comput. Surv.,1lw2):111
+152, 1984.
+         [Kie85]   Werner Kie
+ling. On Semantic Reefs and Ef
+cient Processing of Correlation Queries
+                   with Aggregates. In Alain Pirotte and Yannis Vassiliou, editors, VLDB
+85, Proceed-
+                   ings of 11th International Conference on Very Large Data Bases, Bugust 21-23, 1985,
+                   Stockholm, Sweden.,pages 241
+250. XorganKaufmann, 1985.
+         [Kim82]   WonKim. On Optimizing an SQL-likeNested Query. BCMTrans. Database Syst.,
+                   7w3):443
+4l9, 1982.
+         [KXPS94] AlfonsKemper,GuidoXoerkotte,KlausPeithner,andXichaelSteinbrunn. Optimizing
+                   Disjunctive Queries with Expensive Predicates. In Richard T. Snodgrass and Xarianne
+                   Winslett, editors, Proceedings of the 1994 BCMSIGMOD International Conference
+                   on Management of Data, Minneapolis, Minnesota, May 24-27, 1994.,pages 33l
+347.
+                   ACXPress,1994.
+                                             >GD
+          [KN11]    Alfons Kemper and Thomas Neumann. `yPer: Ahybrid OLTP&OLAP main mem-
+                    ory database system based on virtual memory snapshots. In Serge Abiteboul, Klemens
+                     
+                    Bohm, Christoph Koch, and Kian-Lee Tan, editors, Proceedings of the 27th Interna-
+                    tional Conference on Data Engineering,ICDE 2011, Bpril 11-16, 2011, Hannover,
+                    Germany,pages 195
+20l. IEEE Computer Society,2011.
+          [LBKN14] Viktor Leis, Peter A. Boncz, Alfons Kemper,and Thomas Neumann. Xorsel-driven
+                    parallelism: aNUXA-aware query evaluation framework for the many-core age. In
+                                                       
+                    Curtis E. Dyreson, Feifei Li, and X. Tamer Ozsu, editors, International Conference on
+                    Management of Data, SIGMOD 2014, Snowbird, UT,USB, June 22-27, 2014,pages
+                    743
+754. ACX, 2014.
+          [SAB94]   `ennie J. Steenhagen, Peter X. G. Apers, and `enk X. Blanken. Optimization of
+                    Nested Queries in aComplexObject Xodel. In Xatthias Jarke, Janis A. BubenkoJr.,
+                    and Keith G. Jeffery,editors, Bdvances in Database Technology -EDBT
+94. 4th Inter-
+                    national Conference on Extending Database Technology,Cambridge, United Kingdom,
+                    March 28-31, 1994, Proceedings,volume 779 of LectureNotes in Computer Science,
+                    pages 337
+350. Springer,1994.
+          [S`P+9l] PraveenSeshadri,JosephX.`ellerstein,`amidPirahesh,T. Y. CliffLeung,RaghuRa-
+                    makrishnan, Divesh Srivastava,Peter J. Stuckey,and S. Sudarshan. Cost-Based Opti-
+                    mization for Xagic: Algebra and Implementation. In `. V. Jagadish and Inderpal Singh
+                    Xumick,editors, Proceedings of the 1996 BCMSIGMOD International Conference on
+                    Management of Data, Montreal, Quebec, Canada, June 4-6, 1996.,pages 435
+44l.
+                    ACXPress,199l.
+          [SPL9l]   Praveen Seshadri, `amid Pirahesh, and T. Y. CliffLeung. ComplexQuery Decorre-
+                    lation. In Proceedings of the Twelfth International Conference on Data Engineering,
+                    February 26 -March 1, 1996, NewOrleans, Louisiana,pages 450
+458, 199l.
+          [WXS99] Quan Wang, David Xaier,and Leonard Shapiro.  Algebraic unnesting for nested
+                    queries. Technical report, Oregon `ealth &Science University,CSETech. Paper 252,
+                    1999. http://digitalcommons.ohsu.edu/csetech/252.
+                                               >G9
