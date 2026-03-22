@@ -253,6 +253,11 @@ def build_join_edges(catalog: dict[str, TableSchema]) -> list[JoinEdge]:
     return edges
 
 
+# Calcite SQL reserved keywords that cannot be used as table aliases.
+# "AT" is reserved for AT TIME ZONE syntax and causes parse errors.
+_CALCITE_RESERVED_ALIASES: frozenset[str] = frozenset({"at"})
+
+
 def alias_map(table_names: list[str]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     used: set[str] = set()
@@ -260,7 +265,7 @@ def alias_map(table_names: list[str]) -> dict[str, str]:
         base = "".join(part[0] for part in table_name.split("_")) or table_name[0]
         alias = base
         suffix = 2
-        while alias in used:
+        while alias in used or alias in _CALCITE_RESERVED_ALIASES:
             alias = f"{base}{suffix}"
             suffix += 1
         aliases[table_name] = alias

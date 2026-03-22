@@ -983,6 +983,8 @@ def append_job_like_join_templates(candidates: list[SpjCandidate], context: dict
     appended: list[SpjCandidate] = []
 
     for candidate in candidates:
+        if not hasattr(candidate, "join_type"):
+            continue
         if candidate.join_type != "inner" or len(candidate.tables) < 2 or candidate.render_mode != "ansi":
             continue
         extra_predicates = build_job_like_predicates(candidate, catalog, snapshot)

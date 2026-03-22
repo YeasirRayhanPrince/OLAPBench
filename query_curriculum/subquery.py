@@ -478,8 +478,10 @@ def _build_derived_table_candidates(
 
         child_seeds = top_seed_pool(child, child_alias, snapshot, limit=3, build_context=build_context)
 
-        # Derive a few columns from child table
+        # Derive a few columns from child table, ensuring the FK join column is included.
         child_cols = [(child_alias, col.name) for col in list(child.columns.values())[:4]]
+        if not any(c == edge.child_column for _, c in child_cols):
+            child_cols.append((child_alias, edge.child_column))
 
         proj_options = cached_projection_options(
             [parent.name], {parent.name: parent_alias}, catalog, build_context,
