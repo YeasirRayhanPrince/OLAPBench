@@ -33,7 +33,7 @@ systems:
       database: postgres
 benchmarks:
   - name: gendba-pool
-    query_dir: full_v1
+    query_dir: subquery_v0
 export:
-  training_jsonl_name: gendba_ext.training.jsonl
-  manifest_jsonl_name: gendba_ext.manifest.jsonl
+  training_jsonl_name: gendba_subquery_v0.training.jsonl
+  manifest_jsonl_name: gendba_subquery_v0.manifest.jsonl

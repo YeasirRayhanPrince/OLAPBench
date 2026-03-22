@@ -329,7 +329,7 @@ def build_calcite_training_records(
     plangen_bin: str | None = None,
     work_dir: str | None = None,
     keep_work_dir: bool = False,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     schema_path_obj = Path(schema_path)
     queries_dir_obj = Path(queries_dir)
     schema_name, table_ids = _load_schema_table_ids(schema_path_obj)
@@ -390,7 +390,7 @@ def build_calcite_training_records(
     if temp_dir is not None and not keep_work_dir:
         temp_dir.cleanup()
 
-    return rows
+    return rows, skipped_queries
 
 
 def main():

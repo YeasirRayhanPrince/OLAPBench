@@ -180,6 +180,23 @@ def _extract_actual_loops(attrs: dict[str, Any]) -> int | float:
     return loops if loops is not None else 1
 
 
+def _inject_explain_only_stats(node: dict) -> dict:
+    """Recursively inject estimated row counts as Actual Rows for EXPLAIN (no ANALYZE) output.
+
+    PostgresParser unconditionally reads json_plan["Actual Rows"], which is absent when
+    EXPLAIN is run without ANALYZE. This helper fills in Plan Rows / Actual Loops = 1 so
+    the parser can proceed without modification.
+    """
+    result = dict(node)
+    if "Actual Rows" not in result:
+        result["Actual Rows"] = result.get("Plan Rows", 0)
+    if "Actual Loops" not in result:
+        result["Actual Loops"] = 1
+    if "Plans" in result:
+        result["Plans"] = [_inject_explain_only_stats(c) for c in result["Plans"]]
+    return result
+
+
 def _flatten_plan(node: dict[str, Any], operators: list[dict[str, Any]]):
     attrs = node.get("_attrs", {})
     actual_per_loop = _as_number(attrs.get("exact_cardinality"))
@@ -410,6 +427,104 @@ def _run_physical_group(
     return _collect_physical_tokens(result_csv_path)
 
 
+def _run_explain_group(
+    group: QueryGroup,
+    system: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Run EXPLAIN (format json) for each query and return plan tokens without executing.
+
+    Uses the optimizer's estimated Plan Rows as exact_cardinality so all downstream
+    tokenization and JSONL fields are populated in the same structure as the full
+    benchmark path. Requires a local PG connection configured in the system spec.
+    """
+    try:
+        import psycopg2
+    except ImportError:
+        raise RuntimeError("psycopg2 is required for --explain-only mode")
+
+    from queryplan.parsers.postgresparser import PostgresParser
+    from queryplan.queryplan import encode_query_plan
+
+    params = system["parameter"]
+    host = params.get("local_host", "localhost")
+    port = params.get("local_port", 5432)
+    user = params.get("local_user")
+    password = params.get("local_password") or ""
+    database = params.get("local_database", "postgres")
+
+    tokens: dict[str, dict[str, Any]] = {}
+    sources: dict[str, dict[str, Any]] = {}
+
+    conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=database)
+    conn.autocommit = True
+    print(f"[explain-only] Connected to PostgreSQL at {host}:{port} db={database} user={user}")
+    try:
+        for entry in group.queries:
+            query_id = entry.query_id
+            sql = entry.sql.strip()
+            source_info: dict[str, Any] = {
+                "state": "unknown",
+                "result_csv_path": None,
+                "query_id": query_id,
+                "dbms": system["dbms"],
+                "version": system.get("version"),
+                "title": system.get("title"),
+                "message": None,
+            }
+
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"EXPLAIN (format json) {sql}")
+                    row = cur.fetchone()
+
+                if not row or not row[0]:
+                    source_info["state"] = "error"
+                    source_info["message"] = "No plan returned by EXPLAIN"
+                    sources[query_id] = source_info
+                    continue
+
+                pg_json = row[0]
+                if isinstance(pg_json, list):
+                    pg_json = pg_json[0]
+
+                augmented = _inject_explain_only_stats(pg_json.get("Plan", pg_json))
+                plan_dict = {"Plan": augmented}
+
+                # PostgresParser is stateful (op_counter, ctes) — create one per query
+                parser = PostgresParser(include_system_representation=True)
+                query_plan = parser.parse_json_plan(sql, plan_dict)
+                plan_str = encode_query_plan(query_plan)
+                plan_doc = _loads(plan_str)
+
+                if not isinstance(plan_doc, dict):
+                    source_info["state"] = "error"
+                    source_info["message"] = "Plan encoding produced unexpected type"
+                    sources[query_id] = source_info
+                    continue
+
+                plan_root = plan_doc.get("queryPlan")
+                if not isinstance(plan_root, dict):
+                    source_info["state"] = "error"
+                    source_info["message"] = "No queryPlan key in encoded plan"
+                    sources[query_id] = source_info
+                    continue
+
+                operators: list[dict[str, Any]] = []
+                _flatten_plan(plan_root, operators)
+                tokens[query_id] = {"plan": plan_doc, "operators": operators}
+                source_info["state"] = "success"
+                sources[query_id] = source_info
+
+            except Exception as exc:
+                source_info["state"] = "error"
+                source_info["message"] = str(exc)
+                sources[query_id] = source_info
+    finally:
+        conn.close()
+
+    return tokens, sources
+
+
 def _iter_training_and_manifest_rows(
     query_entries: list[QueryEntry],
     logical_records: dict[str, dict[str, Any]],
@@ -513,10 +628,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     table_name_to_id_by_group: dict[str, dict[str, int]] = {}
     logical_records: dict[str, dict[str, Any]] = {}
+    all_failed_queries: list[dict[str, Any]] = []
     for group in groups:
         calcite_output_dir = work_root / "calcite" / group.group_key
         calcite_output_file = calcite_output_dir / "logical_training.jsonl"
-        records = build_calcite_training_records(
+        records, calcite_skipped = build_calcite_training_records(
             schema_path=str(group.schema_path),
             queries_dir=str(group.queries_dir),
             output_file=str(calcite_output_file),
@@ -524,6 +640,16 @@ def run_pipeline(args: argparse.Namespace) -> int:
             work_dir=str(calcite_output_dir / "plans"),
             keep_work_dir=True,
         )
+        for query_name in calcite_skipped:
+            all_failed_queries.append({
+                "query_id": query_name,
+                "schema": group.schema,
+                "workload": group.workload,
+                "query_set": group.query_set,
+                "failure_stage": "calcite",
+                "state": "skipped",
+                "message": "Calcite plan artifacts not found",
+            })
         table_name_to_id_by_group[group.group_key] = load_table_name_to_id(group.schema_path)
         for record in records:
             logical_records[f"{group.group_key}:{record['query_key']}"] = record
@@ -539,12 +665,18 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         for group in groups:
             try:
-                tokens, sources = _run_physical_group(
-                    group=group,
-                    system=system,
-                    run_cfg=run_cfg,
-                    work_root=work_root,
-                )
+                if args.explain_only:
+                    tokens, sources = _run_explain_group(
+                        group=group,
+                        system=system,
+                    )
+                else:
+                    tokens, sources = _run_physical_group(
+                        group=group,
+                        system=system,
+                        run_cfg=run_cfg,
+                        work_root=work_root,
+                    )
             except Exception as exc:
                 failures += 1
                 if run_cfg["run"].get("fail_fast", False):
@@ -565,6 +697,25 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 physical_tokens_by_engine[engine_key][f"{group.group_key}:{query_id}"] = token
             for query_id, source in sources.items():
                 physical_sources_by_engine[engine_key][f"{group.group_key}:{query_id}"] = source
+
+    composite_key_to_entry: dict[str, QueryEntry] = {
+        f"{e.group_key}:{e.query_id}": e for e in query_entries
+    }
+    for engine_key, engine_sources in physical_sources_by_engine.items():
+        for composite_key, source in engine_sources.items():
+            if source.get("state") == "success":
+                continue
+            entry = composite_key_to_entry.get(composite_key)
+            all_failed_queries.append({
+                "query_id": source.get("query_id", composite_key),
+                "schema": entry.schema if entry else None,
+                "workload": entry.workload if entry else None,
+                "query_set": entry.query_set if entry else None,
+                "failure_stage": "postgres",
+                "engine": engine_key,
+                "state": source.get("state", "unknown"),
+                "message": source.get("message", ""),
+            })
 
     export_cfg = spec.get("export", {})
     training_name = export_cfg.get("training_jsonl_name") or export_cfg.get("jsonl_name") or "training.jsonl"
@@ -606,8 +757,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
         written_rows += len(training_batch)
         print(f"Flushed {written_rows} rows to JSONL outputs")
 
+    failed_name = export_cfg.get("failed_queries_jsonl_name") or "failed_queries.jsonl"
+    failed_path = dataset_root / failed_name
+    _write_jsonl(failed_path, all_failed_queries)
+
     print(f"Training JSONL: {training_path}")
     print(f"Manifest JSONL: {manifest_path}")
+    print(f"Failed queries JSONL: {failed_path}  ({len(all_failed_queries)} entries)")
     print(f"Work directory: {work_root}")
     return 1 if failures else 0
 
@@ -622,6 +778,15 @@ def main():
     parser.add_argument("--very-verbose", action="store_true", help="Enable very verbose benchmark execution.")
     parser.add_argument("--no-clear", action="store_true", help="Do not pass --clear to OLAPBench runs.")
     parser.add_argument("--fail-fast", action="store_true", help="Stop at the first engine/group failure.")
+    parser.add_argument(
+        "--explain-only",
+        action="store_true",
+        help=(
+            "Use EXPLAIN (format json) without ANALYZE to collect optimizer-estimated plans "
+            "without executing queries. Bypasses the OLAPBench benchmark subprocess. "
+            "Requires a local PG connection configured in the dataset YAML."
+        ),
+    )
     args = parser.parse_args()
     raise SystemExit(run_pipeline(args))
 
