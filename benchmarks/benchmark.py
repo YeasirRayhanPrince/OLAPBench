@@ -106,6 +106,18 @@ class Benchmark(ABC):
 
         queries_dir = pathlib.Path(self.queries_path)
 
+        # Pre-build specialized variants map in a single O(n) directory scan.
+        # A specialized variant has the form <query>.sql.<dbms> (2+ suffixes,
+        # second-to-last is ".sql").  Previously this was discovered per-query via
+        # glob(f"{query_file}.*"), which is O(n) per query → O(n²) total on large
+        # query directories (e.g. 85K files × ~90ms/glob ≈ 2+ hours).
+        for entry in queries_dir.iterdir():
+            suffixes = entry.suffixes          # e.g. ['.sql', '.postgres']
+            if len(suffixes) >= 2 and suffixes[-2] == ".sql":
+                base = entry.name[: entry.name.rfind(suffixes[-1])]  # "query.sql"
+                dbms_key = suffixes[-1][1:]                           # "postgres"
+                overrides.setdefault(dbms_key, {})[base] = entry.read_text().strip()
+
         for query_file in natsort.natsorted(os.listdir(self.queries_path)):
 
             # Skip non-SQL files
@@ -120,15 +132,6 @@ class Benchmark(ABC):
 
             query_path = queries_dir / query_file
             query = query_path.read_text().strip()
-
-            # Collect specialized variants for this query
-            for specialized_query_path in queries_dir.glob(f"{query_file}.*"):
-                suffixes = specialized_query_path.suffixes
-                if len(suffixes) < 2:
-                    continue
-
-                specialized_dbms = suffixes[-1][1:]
-                overrides.setdefault(specialized_dbms, {})[query_file] = specialized_query_path.read_text().strip()
 
             # Use a specialized variant of the query, if available for the requested DBMS
             query = overrides.get(dbms_name, {}).get(query_file, query)

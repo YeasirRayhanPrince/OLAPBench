@@ -4,9 +4,14 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import multiprocessing
+import os
 import re
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -427,15 +432,19 @@ def _run_physical_group(
     return _collect_physical_tokens(result_csv_path)
 
 
-def _run_explain_group(
-    group: QueryGroup,
-    system: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Run EXPLAIN (format json) for each query and return plan tokens without executing.
+def _explain_chunk(
+    chunk: list,
+    conn_params: dict,
+    system_meta: dict,
+    chunk_index: int,
+    total_chunks: int,
+    total_queries: int,
+) -> tuple[dict, dict]:
+    """Worker: run EXPLAIN (format json) + parse for one chunk of queries in a subprocess.
 
-    Uses the optimizer's estimated Plan Rows as exact_cardinality so all downstream
-    tokenization and JSONL fields are populated in the same structure as the full
-    benchmark path. Requires a local PG connection configured in the system spec.
+    Must be a module-level function so ProcessPoolExecutor can pickle it under both
+    'fork' and 'spawn' start methods. All heavy imports are done lazily here so they
+    are not required at import time of the parent process.
     """
     try:
         import psycopg2
@@ -445,33 +454,35 @@ def _run_explain_group(
     from queryplan.parsers.postgresparser import PostgresParser
     from queryplan.queryplan import encode_query_plan
 
-    params = system["parameter"]
-    host = params.get("local_host", "localhost")
-    port = params.get("local_port", 5432)
-    user = params.get("local_user")
-    password = params.get("local_password") or ""
-    database = params.get("local_database", "postgres")
+    host = conn_params["host"]
+    port = conn_params["port"]
+    user = conn_params["user"]
+    password = conn_params.get("password") or ""
+    database = conn_params["database"]
 
-    tokens: dict[str, dict[str, Any]] = {}
-    sources: dict[str, dict[str, Any]] = {}
+    tokens: dict = {}
+    sources: dict = {}
 
     conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=database)
     conn.autocommit = True
-    print(f"[explain-only] Connected to PostgreSQL at {host}:{port} db={database} user={user}")
+    print(
+        f"[explain-chunk {chunk_index+1}/{total_chunks}] Connected to PostgreSQL at "
+        f"{host}:{port} db={database} user={user} "
+        f"({len(chunk)} queries of {total_queries} total)"
+    )
     try:
-        for entry in group.queries:
+        for i, entry in enumerate(chunk):
             query_id = entry.query_id
             sql = entry.sql.strip()
-            source_info: dict[str, Any] = {
+            source_info: dict = {
                 "state": "unknown",
                 "result_csv_path": None,
                 "query_id": query_id,
-                "dbms": system["dbms"],
-                "version": system.get("version"),
-                "title": system.get("title"),
+                "dbms": system_meta["dbms"],
+                "version": system_meta.get("version"),
+                "title": system_meta.get("title"),
                 "message": None,
             }
-
             try:
                 with conn.cursor() as cur:
                     cur.execute(f"EXPLAIN (format json) {sql}")
@@ -509,7 +520,7 @@ def _run_explain_group(
                     sources[query_id] = source_info
                     continue
 
-                operators: list[dict[str, Any]] = []
+                operators: list = []
                 _flatten_plan(plan_root, operators)
                 tokens[query_id] = {"plan": plan_doc, "operators": operators}
                 source_info["state"] = "success"
@@ -519,10 +530,152 @@ def _run_explain_group(
                 source_info["state"] = "error"
                 source_info["message"] = str(exc)
                 sources[query_id] = source_info
+
+            if (i + 1) % 500 == 0 or (i + 1) == len(chunk):
+                print(
+                    f"[explain-chunk {chunk_index+1}/{total_chunks}] "
+                    f"{i+1}/{len(chunk)} done"
+                )
     finally:
         conn.close()
 
     return tokens, sources
+
+
+def _run_explain_group(
+    group: QueryGroup,
+    system: dict[str, Any],
+    workers: int = 1,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Run EXPLAIN (format json) for each query and return plan tokens without executing.
+
+    Uses the optimizer's estimated Plan Rows as exact_cardinality so all downstream
+    tokenization and JSONL fields are populated in the same structure as the full
+    benchmark path. Requires a local PG connection configured in the system spec.
+
+    When workers > 1, splits group.queries into equal chunks and dispatches each chunk
+    to a separate subprocess via ProcessPoolExecutor, bypassing the GIL for CPU-bound
+    plan parsing. Each worker opens its own Postgres connection.
+    """
+    try:
+        import psycopg2  # noqa: F401 — validate availability before dispatch
+    except ImportError:
+        raise RuntimeError("psycopg2 is required for --explain-only mode")
+
+    params = system["parameter"]
+    conn_params = {
+        "host": params.get("local_host", "localhost"),
+        "port": params.get("local_port", 5432),
+        "user": params.get("local_user"),
+        "password": params.get("local_password") or "",
+        "database": params.get("local_database", "postgres"),
+    }
+    system_meta = {
+        "dbms": system["dbms"],
+        "version": system.get("version"),
+        "title": system.get("title"),
+    }
+
+    all_queries = group.queries
+    n = len(all_queries)
+    # Plain int tracked in the main process only — no cross-process sharing needed.
+    completed = [0]
+    completed_lock = threading.Lock()
+    progress_interval = 300  # seconds between progress prints
+
+    def _progress_printer(stop_event: threading.Event) -> None:
+        start = time.monotonic()
+        # Print immediately at t=0 so the user sees the phase has started.
+        print(f"[explain-only] Progress: 0/{n} queries done (0%)  —  starting …")
+        while not stop_event.wait(timeout=progress_interval):
+            with completed_lock:
+                done = completed[0]
+            elapsed = time.monotonic() - start
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (n - done) / rate if rate > 0 else float("inf")
+            eta_str = f"{eta/60:.1f} min" if eta != float("inf") else "unknown"
+            print(
+                f"[explain-only] Progress: {done}/{n} queries done "
+                f"({100*done//n}%)  —  {rate:.1f} q/s  —  ETA {eta_str}"
+            )
+
+    stop_event = threading.Event()
+    printer = threading.Thread(target=_progress_printer, args=(stop_event,), daemon=True)
+    printer.start()
+
+    try:
+        if workers <= 1:
+            print(f"[explain-only] Sequential mode: {n} queries.")
+            result = _explain_chunk(
+                chunk=all_queries,
+                conn_params=conn_params,
+                system_meta=system_meta,
+                chunk_index=0,
+                total_chunks=1,
+                total_queries=n,
+            )
+            with completed_lock:
+                completed[0] = n
+            return result
+
+        chunk_size = max(1, (n + workers - 1) // workers)
+        chunks = [all_queries[i : i + chunk_size] for i in range(0, n, chunk_size)]
+        actual_workers = len(chunks)
+
+        print(
+            f"[explain-only] Parallel mode: {actual_workers} workers, "
+            f"{n} queries, ~{chunk_size} queries/chunk."
+        )
+
+        merged_tokens: dict[str, dict[str, Any]] = {}
+        merged_sources: dict[str, dict[str, Any]] = {}
+
+        with ProcessPoolExecutor(max_workers=actual_workers) as pool:
+            futures = {
+                pool.submit(
+                    _explain_chunk,
+                    chunk=chunk,
+                    conn_params=conn_params,
+                    system_meta=system_meta,
+                    chunk_index=idx,
+                    total_chunks=actual_workers,
+                    total_queries=n,
+                ): (idx, chunk)
+                for idx, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                idx, chunk = futures[future]
+                exc = future.exception()
+                if exc is not None:
+                    print(f"[explain-only] Chunk {idx+1}/{actual_workers} failed: {exc}")
+                    for entry in chunk:
+                        merged_sources[entry.query_id] = {
+                            "state": "error",
+                            "result_csv_path": None,
+                            "query_id": entry.query_id,
+                            "dbms": system_meta["dbms"],
+                            "version": system_meta.get("version"),
+                            "title": system_meta.get("title"),
+                            "message": f"[chunk {idx} worker died] {exc}",
+                        }
+                else:
+                    chunk_tokens, chunk_sources = future.result()
+                    merged_tokens.update(chunk_tokens)
+                    merged_sources.update(chunk_sources)
+                    print(
+                        f"[explain-only] Chunk {idx+1}/{actual_workers} complete: "
+                        f"{len(chunk_tokens)} succeeded, "
+                        f"{len(chunk_sources) - len(chunk_tokens)} failed/skipped."
+                    )
+                with completed_lock:
+                    completed[0] += len(chunk)
+
+        return merged_tokens, merged_sources
+
+    finally:
+        stop_event.set()
+        printer.join()
+        print(f"[explain-only] Progress: {n}/{n} queries done (100%)")
 
 
 def _iter_training_and_manifest_rows(
@@ -623,8 +776,22 @@ def run_pipeline(args: argparse.Namespace) -> int:
     if args.no_clear:
         run_cfg["run"]["clear"] = False
 
+    explain_workers: int = (
+        args.explain_workers if args.explain_workers is not None
+        else min(64, os.cpu_count() or 1)
+    )
+    calcite_workers: int = (
+        args.calcite_workers if args.calcite_workers is not None
+        else min(16, os.cpu_count() or 1)
+    )
+
+    print(f"[pipeline] Loading {len(spec.get('benchmarks', []))} benchmark(s) …")
     groups, query_entries = _resolve_query_groups(spec)
     systems = _resolve_systems(spec)
+    print(
+        f"[pipeline] Loaded {len(query_entries)} queries across "
+        f"{len(groups)} group(s), {len(systems)} system(s)."
+    )
 
     table_name_to_id_by_group: dict[str, dict[str, int]] = {}
     logical_records: dict[str, dict[str, Any]] = {}
@@ -632,6 +799,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
     for group in groups:
         calcite_output_dir = work_root / "calcite" / group.group_key
         calcite_output_file = calcite_output_dir / "logical_training.jsonl"
+        print(
+            f"[pipeline] Calcite phase: group={group.group_key}  "
+            f"queries={len(group.queries)}  workers={calcite_workers}"
+        )
         records, calcite_skipped = build_calcite_training_records(
             schema_path=str(group.schema_path),
             queries_dir=str(group.queries_dir),
@@ -639,6 +810,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             plangen_bin=run_cfg["calcite"].get("plangen_bin"),
             work_dir=str(calcite_output_dir / "plans"),
             keep_work_dir=True,
+            workers=calcite_workers,
         )
         for query_name in calcite_skipped:
             all_failed_queries.append({
@@ -669,6 +841,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     tokens, sources = _run_explain_group(
                         group=group,
                         system=system,
+                        workers=explain_workers,
                     )
                 else:
                     tokens, sources = _run_physical_group(
@@ -785,6 +958,27 @@ def main():
             "Use EXPLAIN (format json) without ANALYZE to collect optimizer-estimated plans "
             "without executing queries. Bypasses the OLAPBench benchmark subprocess. "
             "Requires a local PG connection configured in the dataset YAML."
+        ),
+    )
+    parser.add_argument(
+        "--explain-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of worker processes for --explain-only parallelism. "
+            "Default: min(64, os.cpu_count()). Set to 1 to disable parallelism."
+        ),
+    )
+    parser.add_argument(
+        "--calcite-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of parallel JVM processes for Calcite plan generation "
+            "and post-processing workers. Default: min(16, os.cpu_count()). "
+            "Set to 1 to disable parallelism."
         ),
     )
     args = parser.parse_args()

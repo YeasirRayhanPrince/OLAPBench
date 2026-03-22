@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shutil
 import sys
 import tempfile
+import threading
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -322,6 +327,72 @@ def _build_logical_token(plan_json: dict[str, Any], table_ids: dict[str, int]) -
     return "\n".join(lines), pred_registry
 
 
+def _build_record_for_query(
+    query_file: str,
+    queries_dir: str,
+    artifact_dir: str,
+    schema_name: str | None,
+    table_ids: dict[str, int],
+    catalog_path: str | None,
+) -> dict[str, Any] | None:
+    """Worker: build a training record for one query. Returns None if artifacts missing."""
+    queries_dir_obj = Path(queries_dir)
+    artifact_dir_obj = Path(artifact_dir)
+    query_path = queries_dir_obj / query_file
+    query_stem = query_path.stem
+
+    if not _plan_artifacts_exist(artifact_dir_obj, query_stem):
+        return None
+
+    from gendba_pipeline.calcite_plangen_py import PlanGenerator
+    generator = PlanGenerator.__new__(PlanGenerator)  # no jar needed for load_plan
+    generator.verbose = False
+    generator.jar_path = ""  # not used for load_plan
+    plan = generator.load_plan(str(artifact_dir_obj / query_stem))
+
+    logical_ir, pred_registry = _build_logical_token(plan.json_plan, table_ids)
+
+    return {
+        "schema": schema_name,
+        "query_key": query_file,
+        "query_sql": query_path.read_text(),
+        "calcite_plan": plan.text_plan,
+        "logical_tokenized_plan": logical_ir,
+        "pred_registry": pred_registry,
+        "plan_json_path": str(artifact_dir_obj / f"{query_stem}.plan.json"),
+        "plan_text_path": str(artifact_dir_obj / f"{query_stem}.plan.txt"),
+        "global_mapping_path": str(artifact_dir_obj / f"{query_stem}.global-mapping.json"),
+        "annotated_plan_path": str(artifact_dir_obj / f"{query_stem}.annotated.txt"),
+        "catalog_path": catalog_path,
+    }
+
+
+def _make_progress_printer(label: str, counter_fn, total: int, interval: int = 300):
+    """Return (stop_event, thread) for a background 5-minute progress printer.
+
+    counter_fn() is called each tick and must return the current done count.
+    """
+    stop_event = threading.Event()
+
+    def _run(stop_event: threading.Event) -> None:
+        start = time.monotonic()
+        # Print immediately at t=0 so the user sees the phase has started.
+        print(f"[{label}] Progress: 0/{total} done (0%)  —  starting …")
+        while not stop_event.wait(timeout=interval):
+            done = counter_fn()
+            elapsed = time.monotonic() - start
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (total - done) / rate if rate > 0 else float("inf")
+            eta_str = f"{eta / 60:.1f} min" if eta != float("inf") else "unknown"
+            print(
+                f"[{label}] Progress: {done}/{total} done "
+                f"({100 * done // total}%)  —  {rate:.1f} q/s  —  ETA {eta_str}"
+            )
+
+    thread = threading.Thread(target=_run, args=(stop_event,), daemon=True)
+    return stop_event, thread
+
+
 def build_calcite_training_records(
     schema_path: str,
     queries_dir: str,
@@ -329,6 +400,7 @@ def build_calcite_training_records(
     plangen_bin: str | None = None,
     work_dir: str | None = None,
     keep_work_dir: bool = False,
+    workers: int = 1,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     schema_path_obj = Path(schema_path)
     queries_dir_obj = Path(queries_dir)
@@ -342,41 +414,167 @@ def build_calcite_training_records(
         temp_dir = tempfile.TemporaryDirectory(prefix="calcite_plans_")
         work_dir_obj = Path(temp_dir.name)
 
+    sql_files = natsorted(p.name for p in queries_dir_obj.iterdir() if p.suffix == ".sql")
+    total = len(sql_files)
+
+    # ── Phase 1: Run plangen (Java) ───────────────────────────────────────────
     generator = PlanGenerator(jar_path=plangen_bin)
-    generator.generate_plans(
-        schema_path=str(schema_path_obj),
-        queries_dir=str(queries_dir_obj),
-        output_dir=str(work_dir_obj),
-    )
 
-    catalog_path = work_dir_obj / "global-column-catalog.json"
-    rows: list[dict[str, Any]] = []
+    if workers <= 1:
+        # Single JVM call — watch work_dir for .plan.txt files as progress proxy.
+        def _plan_count() -> int:
+            return sum(1 for _ in work_dir_obj.glob("*.plan.txt"))
+
+        stop_ev, printer = _make_progress_printer("calcite-jvm", _plan_count, total)
+        printer.start()
+        try:
+            generator.generate_plans(
+                schema_path=str(schema_path_obj),
+                queries_dir=str(queries_dir_obj),
+                output_dir=str(work_dir_obj),
+            )
+        finally:
+            stop_ev.set()
+            printer.join()
+            print(f"[calcite-jvm] Progress: {_plan_count()}/{total} done (JVM complete)")
+
+        # All artifacts in work_dir_obj
+        stem_to_dir: dict[str, Path] = {Path(f).stem: work_dir_obj for f in sql_files}
+        catalog_path = work_dir_obj / "global-column-catalog.json"
+
+    else:
+        # Parallel JVM: split queries into N batches, each gets its own temp query dir
+        # and output dir, then N plangen processes run in parallel via threads
+        # (subprocess.run releases the GIL).
+        chunk_size = max(1, (total + workers - 1) // workers)
+        chunks = [sql_files[i : i + chunk_size] for i in range(0, total, chunk_size)]
+        actual_workers = len(chunks)
+
+        batch_dirs: list[tuple[Path, Path]] = []
+        for i, chunk in enumerate(chunks):
+            bq_dir = work_dir_obj / f"batch_{i}_queries"
+            bo_dir = work_dir_obj / f"batch_{i}_output"
+            bq_dir.mkdir(parents=True, exist_ok=True)
+            bo_dir.mkdir(parents=True, exist_ok=True)
+            for fname in chunk:
+                link = bq_dir / fname
+                if not link.exists():
+                    os.symlink(queries_dir_obj / fname, link)
+            batch_dirs.append((bq_dir, bo_dir))
+
+        def _plan_count() -> int:
+            return sum(1 for _, bo in batch_dirs for _ in bo.glob("*.plan.txt"))
+
+        print(
+            f"[calcite-jvm] Parallel mode: {actual_workers} workers, "
+            f"{total} queries, ~{chunk_size} queries/batch."
+        )
+
+        stop_ev, printer = _make_progress_printer("calcite-jvm", _plan_count, total)
+        printer.start()
+        try:
+            def _run_batch(args: tuple[Path, Path]) -> None:
+                bq_dir, bo_dir = args
+                generator.generate_plans(
+                    schema_path=str(schema_path_obj),
+                    queries_dir=str(bq_dir),
+                    output_dir=str(bo_dir),
+                )
+
+            with ThreadPoolExecutor(max_workers=actual_workers) as pool:
+                futures = [pool.submit(_run_batch, bd) for bd in batch_dirs]
+                for f in as_completed(futures):
+                    f.result()  # re-raises any JVM exception
+        finally:
+            stop_ev.set()
+            printer.join()
+            print(f"[calcite-jvm] Progress: {_plan_count()}/{total} done (all batches complete)")
+
+        # Build stem -> output dir mapping
+        stem_to_dir = {}
+        for fname in sql_files:
+            stem = Path(fname).stem
+            for _, bo_dir in batch_dirs:
+                if (bo_dir / f"{stem}.plan.txt").exists():
+                    stem_to_dir[stem] = bo_dir
+                    break
+
+        # Use catalog from first batch that produced one
+        catalog_path = work_dir_obj / "global-column-catalog.json"
+        if not catalog_path.exists():
+            for _, bo_dir in batch_dirs:
+                candidate = bo_dir / "global-column-catalog.json"
+                if candidate.exists():
+                    shutil.copy(candidate, catalog_path)
+                    break
+
+    # ── Phase 2: Build training records (parallel Python post-processing) ─────
+    catalog_str = str(catalog_path) if catalog_path.exists() else None
+    post_workers = max(1, workers)
+
+    done_count = [0]
+    done_lock = threading.Lock()
+
+    def _post_count() -> int:
+        with done_lock:
+            return done_count[0]
+
+    stop_ev2, printer2 = _make_progress_printer("calcite-postproc", _post_count, total)
+    printer2.start()
+
+    rows_unordered: list[tuple[int, dict[str, Any]]] = []
     skipped_queries: list[str] = []
-    for query_file in natsorted(path.name for path in queries_dir_obj.iterdir() if path.suffix == ".sql"):
-        query_path = queries_dir_obj / query_file
-        query_key = query_file
-        query_stem = query_path.stem
-        if not _plan_artifacts_exist(work_dir_obj, query_stem):
-            skipped_queries.append(query_key)
-            continue
-        plan = generator.load_plan(str(work_dir_obj / query_stem))
 
-        logical_ir, pred_registry = _build_logical_token(plan.json_plan, table_ids)
+    try:
+        if post_workers <= 1:
+            for i, query_file in enumerate(sql_files):
+                query_stem = Path(query_file).stem
+                artifact_dir = stem_to_dir.get(query_stem, work_dir_obj)
+                row = _build_record_for_query(
+                    query_file=query_file,
+                    queries_dir=str(queries_dir_obj),
+                    artifact_dir=str(artifact_dir),
+                    schema_name=schema_name,
+                    table_ids=table_ids,
+                    catalog_path=catalog_str,
+                )
+                with done_lock:
+                    done_count[0] += 1
+                if row is None:
+                    skipped_queries.append(query_file)
+                else:
+                    rows_unordered.append((i, row))
+        else:
+            indexed_files = list(enumerate(sql_files))
+            with ProcessPoolExecutor(max_workers=post_workers) as pool:
+                futures_map = {
+                    pool.submit(
+                        _build_record_for_query,
+                        query_file=qf,
+                        queries_dir=str(queries_dir_obj),
+                        artifact_dir=str(stem_to_dir.get(Path(qf).stem, work_dir_obj)),
+                        schema_name=schema_name,
+                        table_ids=table_ids,
+                        catalog_path=catalog_str,
+                    ): (idx, qf)
+                    for idx, qf in indexed_files
+                }
+                for future in as_completed(futures_map):
+                    idx, qf = futures_map[future]
+                    row = future.result()
+                    with done_lock:
+                        done_count[0] += 1
+                    if row is None:
+                        skipped_queries.append(qf)
+                    else:
+                        rows_unordered.append((idx, row))
+    finally:
+        stop_ev2.set()
+        printer2.join()
+        print(f"[calcite-postproc] Progress: {_post_count()}/{total} done (complete)")
 
-        row = {
-            "schema": schema_name,
-            "query_key": query_key,
-            "query_sql": query_path.read_text(),
-            "calcite_plan": plan.text_plan,
-            "logical_tokenized_plan": logical_ir,
-            "pred_registry": pred_registry,
-            "plan_json_path": str(work_dir_obj / f"{query_stem}.plan.json"),
-            "plan_text_path": str(work_dir_obj / f"{query_stem}.plan.txt"),
-            "global_mapping_path": str(work_dir_obj / f"{query_stem}.global-mapping.json"),
-            "annotated_plan_path": str(work_dir_obj / f"{query_stem}.annotated.txt"),
-            "catalog_path": str(catalog_path) if catalog_path.exists() else None,
-        }
-        rows.append(row)
+    # Restore natural sort order
+    rows = [row for _, row in sorted(rows_unordered, key=lambda x: x[0])]
 
     if skipped_queries:
         print(
@@ -407,6 +605,13 @@ def main():
         action="store_true",
         help="Keep the auto-created work directory when --work-dir is not provided.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of parallel JVM+postproc workers. Default: min(16, os.cpu_count()).",
+    )
     args = parser.parse_args()
 
     build_calcite_training_records(
@@ -416,6 +621,7 @@ def main():
         plangen_bin=args.plangen_bin,
         work_dir=args.work_dir,
         keep_work_dir=args.keep_work_dir,
+        workers=args.workers if args.workers is not None else min(16, os.cpu_count() or 1),
     )
 
 
