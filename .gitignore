@@ -19,3 +19,7 @@ benchmarks/job/queries_spj_v1
 benchmarks/job/queries_spj_v2
 benchmarks/job/.llm_seed_cache
 subquery_papers
+**/run_explain.sh
+query_curriculum/run_spj.sh
+gendba_pipeline/output/gendba_local_postgres_preloaded/gendba_local_postgres_preloaded_full_vn.training.jsonl
+gendba_pipeline/output/gendba_local_postgres_preloaded/gendba_local_postgres_preloaded_full_vn.manifest.jsonl
