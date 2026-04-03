@@ -308,6 +308,18 @@ def _build_rels_token_lines(
             default_ptr = rels[ptr_index - 1].get("id") if ptr_index > 0 else None
             input_tokens = _rel_inputs(rel, ptr_ids, default_ptr)
             token_lines.append(f"{cond_indent}[INPUT] {input_tokens}")
+            continue
+
+        if operator == "LogicalSort":
+            default_ptr = rels[ptr_index - 1].get("id") if ptr_index > 0 else None
+            input_tokens = _rel_inputs(rel, ptr_ids, default_ptr)
+            token_lines.append(f"{cond_indent}[INPUT] {input_tokens}")
+            continue
+
+        if operator in ("LogicalUnion", "LogicalMinus", "LogicalIntersect"):
+            input_tokens = _rel_inputs(rel, ptr_ids)
+            token_lines.append(f"{cond_indent}[INPUT] {input_tokens}")
+            continue
 
     return token_lines
 

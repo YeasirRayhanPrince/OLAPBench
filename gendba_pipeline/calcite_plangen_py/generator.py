@@ -27,6 +27,20 @@ from .exceptions import (
 logger = logging.getLogger(__name__)
 
 
+def normalize_plan_inputs(json_plan: Dict) -> Dict:
+    """Add explicit 'inputs' to every rel node that omits it.
+
+    Calcite omits 'inputs' on single-input nodes when the input is the
+    immediately preceding rel. This function makes that implicit reference
+    explicit, so all nodes have a uniform 'inputs' array.
+    """
+    rels = json_plan.get("rels", [])
+    for i, rel in enumerate(rels):
+        if "inputs" not in rel and i > 0:
+            rel["inputs"] = [rels[i - 1]["id"]]
+    return json_plan
+
+
 class PlanGenerator:
     """
     Wrapper for the Calcite plangen tool.
@@ -182,7 +196,7 @@ class PlanGenerator:
         json_file = Path(str(plan_path) + ".plan.json")
         if not json_file.exists():
             raise FileNotFoundError(f"Plan JSON file not found: {json_file}")
-        json_plan = json.loads(json_file.read_text())
+        json_plan = normalize_plan_inputs(json.loads(json_file.read_text()))
 
         # Load global mappings
         mapping_file = Path(str(plan_path) + ".global-mapping.json")
@@ -477,6 +491,9 @@ class MultiPlanGenerator:
 
         with open(plans_json_path) as f:
             data = json.load(f)
+
+        for plan in data.get("plans", []):
+            normalize_plan_inputs(plan.get("json", {}))
 
         return MultiPlanResult.from_dict(data)
 

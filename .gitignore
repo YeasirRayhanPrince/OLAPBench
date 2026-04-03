@@ -23,3 +23,4 @@ subquery_papers
 query_curriculum/run_spj.sh
 gendba_pipeline/output/gendba_local_postgres_preloaded/gendba_local_postgres_preloaded_full_vn.training.jsonl
 gendba_pipeline/output/gendba_local_postgres_preloaded/gendba_local_postgres_preloaded_full_vn.manifest.jsonl
+**/**.jsonl

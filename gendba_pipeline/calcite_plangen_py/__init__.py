@@ -31,7 +31,7 @@ Example (Multiple Plans):
 __version__ = "0.1.0"
 __author__ = "Apache Calcite Contributors"
 
-from .generator import PlanGenerator, MultiPlanGenerator
+from .generator import PlanGenerator, MultiPlanGenerator, normalize_plan_inputs
 from .models import (
     QueryPlan,
     GlobalColumnMapping,
@@ -53,6 +53,7 @@ __all__ = [
     # Generators
     "PlanGenerator",
     "MultiPlanGenerator",
+    "normalize_plan_inputs",
     # Models
     "QueryPlan",
     "GlobalColumnMapping",

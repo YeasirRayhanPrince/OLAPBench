@@ -244,8 +244,9 @@ def _get_unary_op(pg_label: str, attrs: dict) -> str:
 # Core traversal
 # ---------------------------------------------------------------------------
 
-# Entry = (ir_ptr, phys_op, join_type_or_None, child_ir_ptrs_or_None)
-Entry = tuple[int, str, str | None, list[int] | None]
+# Entry = (ir_ptr, phys_op, join_type_or_None, input_tokens_or_None)
+# input_tokens are pre-formatted: "[PTR_N]" for operators, "[TN]" for table scans
+Entry = tuple[int, str, str | None, list[str] | None]
 
 
 def _traverse(
@@ -350,7 +351,9 @@ def _traverse(
             if alias:
                 ctx.alias_to_table[alias] = table_name
 
-        return combined + [(ir_ptr, phys_op, None, None)], ir_ptr, table_set | all_child_tables
+        table_tok = f"[T{table_id}]" if table_id is not None else ""
+        inputs = [table_tok] if table_tok else []
+        return combined + [(ir_ptr, phys_op, None, inputs)], ir_ptr, table_set | all_child_tables
 
     # ---- Join ----
     if label == "Join":
@@ -397,7 +400,7 @@ def _traverse(
                                used_ir_ptrs, ptr_costs)
         used_ir_ptrs.add(ir_ptr)
         ptr_costs[ir_ptr] = cardinality
-        return combined + fused + [(ir_ptr, phys_op, join_type, list(child_ir_ptrs))], ir_ptr, all_child_tables
+        return combined + fused + [(ir_ptr, phys_op, join_type, [f"[PTR_{p}]" for p in child_ir_ptrs])], ir_ptr, all_child_tables
 
     # ---- Unary: GroupBy, Sort, Limit, Filter ----
     child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
@@ -416,6 +419,12 @@ def _traverse(
                 ir_ptr = cand
                 break
     if ir_ptr is None:
+        ir_ptr, chain_consumed = _find_chain_unary_match(
+            child_ir_ptr, label, ir_nodes, used_ir_ptrs)
+        for p in chain_consumed:
+            used_ir_ptrs.add(p)
+            ptr_costs.setdefault(p, 1)
+    if ir_ptr is None:
         return combined, child_ir_ptr, all_child_tables
 
     phys_op = _get_unary_op(label, attrs)
@@ -423,7 +432,7 @@ def _traverse(
                            used_ir_ptrs, ptr_costs)
     used_ir_ptrs.add(ir_ptr)
     ptr_costs[ir_ptr] = cardinality
-    return combined + fused + [(ir_ptr, phys_op, None, None)], ir_ptr, all_child_tables
+    return combined + fused + [(ir_ptr, phys_op, None, [f"[PTR_{child_ir_ptr}]"])], ir_ptr, all_child_tables
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +497,75 @@ def _find_subquery_filter(
     return None
 
 
+def _find_chain_unary_match(
+    child_ir_ptr: int,
+    pg_label: str,
+    ir_nodes: dict[int, IRNode],
+    used_ir_ptrs: set[int],
+) -> tuple[int | None, list[int]]:
+    """Walk up the IR unary chain from child_ir_ptr to find a matching node.
+
+    PG fuses Filter→Project→Aggregate into a single GroupBy node whose physical
+    child is the join root, not the logical input of the aggregate.  This helper
+    climbs the logical IR parent chain until it finds a node whose op matches
+    pg_label, collecting intermediate nodes to be silently consumed.
+
+    Primary attempt: walk from child_ir_ptr.
+    Fallback: walk from any used (matched) IR ptr — handles the case where the
+    physical child was re-assigned to a different IR join than the one at the
+    bottom of the unary chain (join-order reordering by PG).
+
+    Returns (matched_ptr, consumed_intermediates).
+    """
+    # Build reverse parent map: ptr -> list of unary parents
+    parents_of: dict[int, list[int]] = {}
+    for ptr, node in ir_nodes.items():
+        if ptr in used_ir_ptrs:
+            continue
+        if node.op in ("LogicalTableScan", "LogicalJoin") or node.subquery_ptrs:
+            continue
+        for inp in node.inputs:
+            parents_of.setdefault(inp, []).append(ptr)
+
+    target_ops = _PG_LABEL_TO_IR_OPS.get(pg_label, set())
+    if not target_ops:
+        return None, []
+
+    def _walk(start: int) -> tuple[int | None, list[int]]:
+        consumed: list[int] = []
+        visited: set[int] = set()
+        current = start
+        while True:
+            upward = [p for p in parents_of.get(current, [])
+                      if p not in used_ir_ptrs and p not in visited]
+            if not upward:
+                return None, []
+            candidate = upward[0]
+            visited.add(candidate)
+            node = ir_nodes[candidate]
+            if node.op in target_ops:
+                return candidate, consumed
+            consumed.append(candidate)
+            current = candidate
+
+    # Primary: walk directly from the physical child
+    result, consumed = _walk(child_ir_ptr)
+    if result is not None:
+        return result, consumed
+
+    # Fallback: walk from any used ptr that has unary parents in the IR.
+    # This handles join-order reordering where the physical child PTR differs
+    # from the logical join root that anchors the unary chain.
+    for used_ptr in used_ir_ptrs:
+        if used_ptr not in parents_of:
+            continue
+        result, consumed = _walk(used_ptr)
+        if result is not None:
+            return result, consumed
+
+    return None, []
+
+
 def _collect_fused(
     child_ir_ptrs: list[int],
     parent_ir_ptr: int,
@@ -516,14 +594,12 @@ def _collect_fused(
         # Table scans and joins must only be matched by their own handlers
         if node.op in ("LogicalTableScan", "LogicalJoin"):
             continue
-        phys_op = _LOGICAL_TO_PHYS_DEFAULT.get(node.op, "Filter")
+        # Silently consumed — fused into the parent physical operator; do not emit
         used_ir_ptrs.add(inp)
         ptr_costs.setdefault(inp, 1)
-        fused.append((inp, phys_op, None, None))
         stack.extend(node.inputs)
 
-    fused.reverse()  # topological: leaves first
-    return fused
+    return []
 
 
 def _insert_missing_ptrs(
@@ -553,14 +629,18 @@ def _insert_missing_ptrs(
     for ptr in ordered:
         node = ir_nodes[ptr]
         ptr_costs.setdefault(ptr, 1)
+        # Filter and Project are always fused into scans/aggregates by PG — skip
+        if node.op in ("LogicalFilter", "LogicalProject"):
+            continue
         if node.op == "LogicalTableScan":
-            extra.append((ptr, "SeqScan", None, None))
+            t_tok = f"[T{node.table_id}]" if node.table_id is not None else ""
+            extra.append((ptr, "SeqScan", None, [t_tok] if t_tok else []))
         elif node.op == "LogicalJoin":
             jt = node.join_type or "[INNER]"
-            extra.append((ptr, "HashJoin", jt, list(node.inputs)))
+            extra.append((ptr, "HashJoin", jt, [f"[PTR_{p}]" for p in node.inputs]))
         else:
             phys_op = _LOGICAL_TO_PHYS_DEFAULT.get(node.op, "Filter")
-            extra.append((ptr, phys_op, None, None))
+            extra.append((ptr, phys_op, None, [f"[PTR_{p}]" for p in node.inputs]))
 
     # Preserve PG post-order for matched entries; missing PTRs appended at end.
     return entries + extra
@@ -884,8 +964,8 @@ def tokenize_physical_plan(
             for role, preds in sorted(pred_annotations.get(ir_ptr, {}).items()):
                 tok += f" [{role} {' '.join(f'P_{p}' for p in preds)}]"
             lines.append(tok)
-            if child_ptrs:
-                lines.append(f"    [INPUT] {' '.join(f'[PTR_{p}]' for p in child_ptrs)}")
+            if child_ptrs is not None:
+                lines.append(f"    [INPUT] {' '.join(child_ptrs)}")
         lines.append("[/PHYSICAL_PLAN]")
         return ("\n".join(lines), cardinalities)
 
