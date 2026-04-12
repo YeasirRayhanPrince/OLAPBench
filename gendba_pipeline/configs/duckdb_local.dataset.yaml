@@ -1,0 +1,37 @@
+name: gendba_local_duckdb
+output_root: gendba_pipeline/output/gendba_local_duckdb
+calcite:
+  plangen_bin: /scratch1/yrayhan/calcite/benchmarks/plangen/build/install/plangen/bin/plangen
+include_non_success: false
+run:
+  clear: true
+  verbose: true
+  fail_fast: false
+benchmark_defaults:
+  repetitions: 1
+  warmup: 0
+  timeout: 300
+  global_timeout: 0
+  fetch_result: false
+  # managed = create .duckdb from CSVs if it doesn't exist, then run explain queries.
+  # preloaded = connect to existing .duckdb file (local.path must already exist).
+  # After the first managed run the file persists; subsequent managed runs skip loading.
+  # To force a full reload: delete local.path then re-run with managed.
+  load_mode: managed
+  query_plan:
+    retrieve: true
+    system_representation: true
+systems:
+  - title: Local DuckDB
+    dbms: duckdb
+    parameter:
+      version: "1.5.1"
+    local:
+      enabled: true
+      path: /scratch1/yrayhan/OLAPBench/data/job.duckdb   # where to create/read the DB
+      data_dir: /scratch1/yrayhan/OLAPBench/data/job      # CSV dir (managed mode only)
+benchmarks:
+  - name: job
+export:
+  training_jsonl_name: gendba_local_duckdb_job.training.jsonl
+  manifest_jsonl_name: gendba_local_duckdb_job.manifest.jsonl

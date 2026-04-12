@@ -127,6 +127,22 @@ def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, An
     return merged
 
 
+def _transpile_sql(sql: str, read_dialect: str, write_dialect: str) -> str:
+    """Transpile *sql* from *read_dialect* to *write_dialect* using sqlglot.
+
+    Falls back to the original SQL string if sqlglot raises (e.g. unsupported
+    syntax), logging a one-line warning so failures are visible but non-fatal.
+    """
+    try:
+        import sqlglot
+        stmts = sqlglot.transpile(sql, read=read_dialect, write=write_dialect)
+        if stmts:
+            return stmts[0]
+    except Exception as exc:
+        print(f"[transpile] WARNING: could not transpile SQL ({exc}); using original", flush=True)
+    return sql
+
+
 def _query_set_id(query_dir: str | None) -> str:
     return "default" if not query_dir else _slugify(query_dir)
 
@@ -244,16 +260,20 @@ def _resolve_systems(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 local = deepcopy(system.get("local"))
 
                 if local and local.get("enabled", False):
-                    if system["dbms"] != "postgres":
-                        raise ValueError(
-                            f"Local mode is currently only supported for postgres, not {system['dbms']}"
-                        )
                     params["use_local"] = True
-                    params["local_host"] = local.get("host", "localhost")
-                    params["local_port"] = local.get("port")
-                    params["local_user"] = local.get("user")
-                    params["local_password"] = local.get("password")
-                    params["local_database"] = local.get("database")
+                    if system["dbms"] == "duckdb":
+                        params["local_path"] = local.get("path")
+                        params["local_data_dir"] = local.get("data_dir")
+                    elif system["dbms"] == "postgres":
+                        params["local_host"] = local.get("host", "localhost")
+                        params["local_port"] = local.get("port")
+                        params["local_user"] = local.get("user")
+                        params["local_password"] = local.get("password")
+                        params["local_database"] = local.get("database")
+                    else:
+                        raise ValueError(
+                            f"Local mode is not supported for {system['dbms']}"
+                        )
 
                 title = Template(system["title"]).substitute(**current_settings, **params)
                 version = str(params.get("version", "latest"))
@@ -542,34 +562,229 @@ def _explain_chunk(
     return tokens, sources
 
 
+def _setup_duckdb_database(
+    db_path: str,
+    data_dir: str,
+    schema_path: str,
+    index: str = "primary",
+) -> None:
+    """Create a persistent DuckDB file and load data from CSVs.
+
+    Mirrors Docker load_database() exactly:
+      1. index param controls primary_key / foreign_keys (default: primary → PKs only)
+      2. _transform_schema(): sql.transform_schema(escape='"', lowercase=False)
+      3. DuckDB._create_table_statements(alter_table=False): inline constraints
+      4. DuckDB._copy_statements(): copy_statements_postgres(..., supports_text=False)
+
+    If the file already exists, loading is skipped (create-if-not-exists).
+    The file is never deleted by the pipeline — it persists for future preloaded runs.
+    On failure, any partial file is removed so the next run starts clean.
+    """
+    try:
+        import duckdb as _duckdb
+    except ImportError:
+        raise RuntimeError("duckdb Python package is required for managed DuckDB loading")
+
+    from util import sql as _sql, schemajson as _schemajson
+
+    _db_path = Path(db_path)
+    if _db_path.exists():
+        print(f"[setup-duckdb] {_db_path} already exists — skipping load (delete to reload)")
+        return
+
+    _db_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[setup-duckdb] Creating {_db_path} from {data_dir} (index={index}) …")
+
+    # Derive primary_key / foreign_keys from index param — mirrors DBMS.load_database()
+    primary_key = index in ("primary", "foreign")
+    foreign_keys = index == "foreign"
+
+    # Load schema and inject file paths — mirrors benchmark.get_schema()
+    schema = _schemajson.load(str(schema_path), "dbschema.schema.json")
+    for table in schema["tables"]:
+        table["file"] = table["name"] + "." + schema["file_ending"]
+        if not primary_key:
+            table.pop("primary key", None)
+        if not foreign_keys:
+            table.get("foreign keys", []).clear()
+
+    # _transform_schema(): wrap all names in double-quotes
+    schema = _sql.transform_schema(schema, escape='"', lowercase=False)
+
+    # DuckDB._create_table_statements(alter_table=False)
+    create_stmts = _sql.create_table_statements(schema, alter_table=False)
+
+    # DuckDB._copy_statements() for v1.5.1 (not in singlethreaded list)
+    copy_stmts = _sql.copy_statements_postgres(schema, data_dir, supports_text=False)
+
+    conn = _duckdb.connect(str(_db_path))
+    try:
+        for stmt in create_stmts:
+            parts = stmt.split('"')
+            label = parts[1] if len(parts) > 1 else "..."
+            print(f"[setup-duckdb]   CREATE TABLE {label}")
+            conn.execute(stmt)
+        for stmt in copy_stmts:
+            parts = stmt.split('"')
+            table_label = parts[1] if len(parts) > 1 else "..."
+            print(f"[setup-duckdb]   LOAD {table_label} …", end="", flush=True)
+            conn.execute(stmt)
+            count = conn.execute(f'SELECT COUNT(*) FROM "{table_label}"').fetchone()[0]
+            print(f" {count:,} rows")
+    except Exception:
+        conn.close()
+        _db_path.unlink(missing_ok=True)
+        raise
+    conn.close()
+    print(f"[setup-duckdb] Done — {_db_path}")
+
+
+def _explain_chunk_duckdb(
+    chunk: list,
+    conn_params: dict,
+    system_meta: dict,
+    chunk_index: int,
+    total_chunks: int,
+    total_queries: int,
+) -> tuple[dict, dict]:
+    """Worker: run EXPLAIN ANALYZE (FORMAT JSON) + parse for one chunk of queries via DuckDB.
+
+    Uses the duckdb Python library to connect directly to a local .duckdb file.
+    EXPLAIN ANALYZE executes the query and returns real cardinalities, so no stat
+    injection is needed. Must be a module-level function so ProcessPoolExecutor can
+    pickle it under both 'fork' and 'spawn' start methods.
+    """
+    try:
+        import duckdb
+    except ImportError:
+        raise RuntimeError("duckdb Python package is required for DuckDB explain-only mode")
+
+    try:
+        import simplejson as _json
+    except ImportError:
+        import json as _json
+
+    from queryplan.parsers.duckdbparser import DuckDBParser
+    from queryplan.queryplan import encode_query_plan
+
+    db_path = conn_params["path"]
+    tokens: dict = {}
+    sources: dict = {}
+
+    conn = duckdb.connect(db_path, read_only=True)
+    print(
+        f"[explain-chunk-duckdb {chunk_index+1}/{total_chunks}] Connected to DuckDB at "
+        f"{db_path} ({len(chunk)} queries of {total_queries} total)"
+    )
+    try:
+        for i, entry in enumerate(chunk):
+            query_id = entry.query_id
+            sql = entry.sql.strip()
+            exec_sql = _transpile_sql(sql, read_dialect="postgres", write_dialect="duckdb")
+            source_info: dict = {
+                "state": "unknown",
+                "result_csv_path": None,
+                "query_id": query_id,
+                "dbms": system_meta["dbms"],
+                "version": system_meta.get("version"),
+                "title": system_meta.get("title"),
+                "message": None,
+            }
+            try:
+                result = conn.execute(f"EXPLAIN (FORMAT JSON, ANALYZE) {exec_sql}").fetchone()
+
+                if not result or result[1] is None:
+                    source_info["state"] = "error"
+                    source_info["message"] = "No plan returned by EXPLAIN ANALYZE"
+                    sources[query_id] = source_info
+                    continue
+
+                json_plan = _json.loads(result[1])
+
+                parser = DuckDBParser(include_system_representation=True)
+                query_plan = parser.parse_json_plan(sql, json_plan)
+                plan_str = encode_query_plan(query_plan)
+                plan_doc = _loads(plan_str)
+
+                if not isinstance(plan_doc, dict):
+                    source_info["state"] = "error"
+                    source_info["message"] = "Plan encoding produced unexpected type"
+                    sources[query_id] = source_info
+                    continue
+
+                plan_root = plan_doc.get("queryPlan")
+                if not isinstance(plan_root, dict):
+                    source_info["state"] = "error"
+                    source_info["message"] = "No queryPlan key in encoded plan"
+                    sources[query_id] = source_info
+                    continue
+
+                operators: list = []
+                _flatten_plan(plan_root, operators)
+                tokens[query_id] = {"plan": plan_doc, "operators": operators}
+                source_info["state"] = "success"
+                sources[query_id] = source_info
+
+            except Exception as exc:
+                source_info["state"] = "error"
+                source_info["message"] = str(exc)
+                sources[query_id] = source_info
+
+            if (i + 1) % 500 == 0 or (i + 1) == len(chunk):
+                print(
+                    f"[explain-chunk-duckdb {chunk_index+1}/{total_chunks}] "
+                    f"{i+1}/{len(chunk)} done"
+                )
+    finally:
+        conn.close()
+
+    return tokens, sources
+
+
 def _run_explain_group(
     group: QueryGroup,
     system: dict[str, Any],
     workers: int = 1,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Run EXPLAIN (format json) for each query and return plan tokens without executing.
+    """Run EXPLAIN for each query and return plan tokens without executing.
 
-    Uses the optimizer's estimated Plan Rows as exact_cardinality so all downstream
-    tokenization and JSONL fields are populated in the same structure as the full
-    benchmark path. Requires a local PG connection configured in the system spec.
+    Routes to a DBMS-specific chunk worker (_explain_chunk for postgres,
+    _explain_chunk_duckdb for duckdb). Uses the optimizer's estimated cardinalities
+    (or EXPLAIN ANALYZE real cardinalities for DuckDB) so all downstream tokenization
+    and JSONL fields are populated in the same structure as the full benchmark path.
 
     When workers > 1, splits group.queries into equal chunks and dispatches each chunk
     to a separate subprocess via ProcessPoolExecutor, bypassing the GIL for CPU-bound
-    plan parsing. Each worker opens its own Postgres connection.
+    plan parsing. Each worker opens its own DB connection.
     """
-    try:
-        import psycopg2  # noqa: F401 — validate availability before dispatch
-    except ImportError:
-        raise RuntimeError("psycopg2 is required for --explain-only mode")
-
     params = system["parameter"]
-    conn_params = {
-        "host": params.get("local_host", "localhost"),
-        "port": params.get("local_port", 5432),
-        "user": params.get("local_user"),
-        "password": params.get("local_password") or "",
-        "database": params.get("local_database", "postgres"),
-    }
+    dbms = system["dbms"]
+
+    if dbms == "postgres":
+        try:
+            import psycopg2  # noqa: F401 — validate availability before dispatch
+        except ImportError:
+            raise RuntimeError("psycopg2 is required for --explain-only mode with postgres")
+        conn_params = {
+            "host": params.get("local_host", "localhost"),
+            "port": params.get("local_port", 5432),
+            "user": params.get("local_user"),
+            "password": params.get("local_password") or "",
+            "database": params.get("local_database", "postgres"),
+        }
+        chunk_fn = _explain_chunk
+    elif dbms == "duckdb":
+        try:
+            import duckdb  # noqa: F401 — validate availability before dispatch
+        except ImportError:
+            raise RuntimeError("duckdb Python package is required for --explain-only mode with duckdb")
+        conn_params = {
+            "path": params.get("local_path"),
+        }
+        chunk_fn = _explain_chunk_duckdb
+    else:
+        raise ValueError(f"--explain-only mode is not supported for dbms '{dbms}'")
+
     system_meta = {
         "dbms": system["dbms"],
         "version": system.get("version"),
@@ -606,7 +821,7 @@ def _run_explain_group(
     try:
         if workers <= 1:
             print(f"[explain-only] Sequential mode: {n} queries.")
-            result = _explain_chunk(
+            result = chunk_fn(
                 chunk=all_queries,
                 conn_params=conn_params,
                 system_meta=system_meta,
@@ -633,7 +848,7 @@ def _run_explain_group(
         with ProcessPoolExecutor(max_workers=actual_workers) as pool:
             futures = {
                 pool.submit(
-                    _explain_chunk,
+                    chunk_fn,
                     chunk=chunk,
                     conn_params=conn_params,
                     system_meta=system_meta,
@@ -829,6 +1044,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
     physical_tokens_by_engine: dict[str, dict[str, dict[str, Any]]] = {}
     physical_sources_by_engine: dict[str, dict[str, dict[str, Any]]] = {}
 
+    load_mode = run_cfg["benchmark_defaults"].get("load_mode", "managed")
+    duckdb_loaded: set[tuple[str, str]] = set()
+
     failures = 0
     for system in systems:
         engine_key = _engine_key(system["dbms"], system["version"])
@@ -836,6 +1054,22 @@ def run_pipeline(args: argparse.Namespace) -> int:
         physical_sources_by_engine[engine_key] = {}
 
         for group in groups:
+            # DuckDB managed load: create the .duckdb file from CSVs if it doesn't exist.
+            # Runs once per (engine, group) pair. The file is never deleted — it persists
+            # for future runs (preloaded or managed both connect to the same file).
+            if (args.explain_only
+                    and system["dbms"] == "duckdb"
+                    and load_mode == "managed"):
+                load_key = (engine_key, group.group_key)
+                if load_key not in duckdb_loaded:
+                    _setup_duckdb_database(
+                        db_path=system["parameter"]["local_path"],
+                        data_dir=system["parameter"]["local_data_dir"],
+                        schema_path=str(group.schema_path),
+                        index=system["parameter"].get("index", "primary"),
+                    )
+                    duckdb_loaded.add(load_key)
+
             try:
                 if args.explain_only:
                     tokens, sources = _run_explain_group(

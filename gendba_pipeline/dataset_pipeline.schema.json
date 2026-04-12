@@ -81,6 +81,12 @@
             },
             "database": {
               "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "data_dir": {
+              "type": "string"
             }
           },
           "required": [
