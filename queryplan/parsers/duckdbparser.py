@@ -11,15 +11,65 @@ class DuckDBParser(PlanParser):
         self.include_system_representation = include_system_representation
         self.op_counter = 0
 
-    def parse_json_plan(self, query: str, json_plan: dict) -> QueryPlan:
-        assert len(json_plan["children"]) == 1
-        json_plan = json_plan["children"][0]
-        assert json_plan["operator_type"] == "EXPLAIN_ANALYZE" and len(json_plan["children"]) == 1
-        json_plan = json_plan["children"][0]
+    # Plain EXPLAIN uses different names for some operators than ANALYZE does.
+    _PLAIN_NAME_MAP: dict[str, str] = {
+        "SEQ_SCAN": "TABLE_SCAN",
+    }
 
-        plan = self.build_initial_plan(json_plan)
+    @staticmethod
+    def _normalize_plain_node(node: dict) -> dict:
+        """Convert a plain EXPLAIN (FORMAT JSON) node to ANALYZE-compatible format.
+
+        Plain format uses 'name' instead of 'operator_type' and has no
+        'operator_cardinality'. Rename and inject from Estimated Cardinality.
+
+        For operators that lack Estimated Cardinality (e.g. TOP_N), fall back to
+        the first child's cardinality, capped by the Top (LIMIT) value if present.
+        """
+        result = dict(node)
+        if "name" in result and "operator_type" not in result:
+            name = result.pop("name")
+            result["operator_type"] = DuckDBParser._PLAIN_NAME_MAP.get(name, name)
+        # Normalize children first so their cardinalities are available below.
+        if "children" in result:
+            result["children"] = [
+                DuckDBParser._normalize_plain_node(child)
+                for child in result["children"]
+            ]
+        if "operator_cardinality" not in result:
+            estimated = result.get("extra_info", {}).get("Estimated Cardinality")
+            if estimated is not None:
+                result["operator_cardinality"] = int(estimated)
+            elif result.get("children"):
+                # Propagate first child's cardinality (covers TOP_N and similar).
+                child_card = result["children"][0].get("operator_cardinality", 0)
+                limit_str = result.get("extra_info", {}).get("Top")
+                if limit_str is not None:
+                    try:
+                        result["operator_cardinality"] = min(int(limit_str), child_card)
+                    except (ValueError, TypeError):
+                        result["operator_cardinality"] = child_card
+                else:
+                    result["operator_cardinality"] = child_card
+            else:
+                result["operator_cardinality"] = 0
+        return result
+
+    def parse_json_plan(self, query: str, json_plan) -> QueryPlan:
+        if isinstance(json_plan, list):
+            # Plain EXPLAIN (FORMAT JSON): top-level is a list of root nodes
+            root_node = self._normalize_plain_node(json_plan[0])
+        else:
+            # EXPLAIN (FORMAT JSON, ANALYZE): unwrap the EXPLAIN_ANALYZE wrapper
+            assert len(json_plan["children"]) == 1
+            json_plan = json_plan["children"][0]
+            assert json_plan["operator_type"] == "EXPLAIN_ANALYZE" and len(json_plan["children"]) == 1
+            root_node = json_plan["children"][0]
+
+        plan = self.build_initial_plan(root_node)
         root = InnerNode(Result(-1), exact_cardinality=plan.exact_cardinality,
-                         estimated_cardinality=plan.estimated_cardinality, children=[plan], system_representation="// added by benchy")
+                         estimated_cardinality=plan.estimated_cardinality, children=[plan],
+                         system_representation="// added by benchy")
         return QueryPlan(text=query, plan=root)
 
     def build_initial_plan(self, json_plan: dict) -> PlanNode:

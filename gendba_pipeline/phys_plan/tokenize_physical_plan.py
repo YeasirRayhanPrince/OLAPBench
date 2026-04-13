@@ -56,6 +56,22 @@ _LOGICAL_TO_PHYS_DEFAULT: dict[str, str] = {
     "LogicalSort": "Sort",
     "LogicalLimit": "Limit",
     "LogicalTableScan": "SeqScan",
+    # Set operations
+    "LogicalMinus":     "SetOp",   # EXCEPT / MINUS
+    "LogicalUnion":     "SetOp",   # UNION / UNION ALL
+    "LogicalIntersect": "SetOp",   # INTERSECT
+}
+
+# Calcite IR op names for set-operation nodes
+_LOGICAL_SETOP_OPS: frozenset[str] = frozenset(
+    {"LogicalMinus", "LogicalUnion", "LogicalIntersect"}
+)
+
+# Maps Calcite set-op IR node to the annotation token used in ir_physical_plan_token
+_LOGICAL_SETOP_ANNOTATION: dict[str, str] = {
+    "LogicalMinus":     "[EXCEPT]",
+    "LogicalUnion":     "[UNION_ALL]",
+    "LogicalIntersect": "[INTERSECT]",
 }
 
 # ---------------------------------------------------------------------------
@@ -67,6 +83,8 @@ _PG_LABEL_TO_IR_OPS: dict[str, set[str]] = {
     "Sort": {"LogicalSort"},
     "Limit": {"LogicalLimit"},
     "Filter": {"LogicalFilter"},
+    "Window": {"LogicalWindow", "LogicalAggregate"},   # Calcite may model windows as LogicalWindow or LogicalAggregate
+    "Map":    {"LogicalFilter", "LogicalProject"},     # PG Result node (constant projection / one-time filter)
 }
 
 # ---------------------------------------------------------------------------
@@ -95,12 +113,24 @@ _AGG_METHOD_MAP: dict[str, str] = {
 }
 
 _JOIN_TYPE_MAP: dict[str, str] = {
+    # PostgreSQL / Hyper style (capitalized)
     "Inner": "[INNER]",
     "Left": "[LEFT]",
     "Right": "[RIGHT]",
     "Anti": "[ANTI]",
     "Semi": "[SEMI]",
     "Full": "[FULL]",
+    # DuckDB style (lowercase, compound) produced by Join.fill() in queryoperator.py
+    "inner": "[INNER]",
+    "single": "[INNER]",        # correlated subquery 1-row lookup
+    "leftouter": "[LEFT]",
+    "rightouter": "[RIGHT]",
+    "fullouter": "[FULL]",
+    "leftsemi": "[LEFT] [SEMI]",
+    "rightsemi": "[RIGHT] [SEMI]",
+    "leftanti": "[LEFT] [ANTI]",
+    "rightanti": "[RIGHT] [ANTI]",
+    "rightmark": "[RIGHT] [ANTI]",  # mark join has anti semantics
 }
 
 # ---------------------------------------------------------------------------
@@ -241,6 +271,26 @@ def _get_unary_op(pg_label: str, attrs: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Synthetic PTR helpers
+# ---------------------------------------------------------------------------
+
+def _get_synth_ptr(ir_nodes: dict[int, "IRNode"], used_ir_ptrs: set[int]) -> int:
+    """Return a PTR integer that does not collide with any real IR node or used PTR."""
+    base = max(ir_nodes.keys(), default=999) + 1
+    while base in used_ir_ptrs:
+        base += 1
+    return base
+
+
+def _find_any_unused_scan(ir_nodes: dict[int, "IRNode"], used: set[int]) -> int | None:
+    """Return any unused LogicalTableScan PTR (used by EmptyResult matching)."""
+    for ptr, node in ir_nodes.items():
+        if node.op == "LogicalTableScan" and ptr not in used:
+            return ptr
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Core traversal
 # ---------------------------------------------------------------------------
 
@@ -270,10 +320,23 @@ def _traverse(
     label = node.get("_label", "")
     attrs = node.get("_attrs", {})
 
-    # Transparent wrappers
-    if label in ("Result", "CustomOperator"):
+    # DuckDB Select (FILTER) node: transparent when it sits above a scan-level
+    # operator so the predicate fuses into SeqScan [FILTER] annotation (PG-compatible).
+    # Emit a real Filter node when it sits above a Join or GroupBy (post-join /
+    # HAVING-style filter that cannot be pushed to scan level).
+    if label == "Select":
+        child_labels = {c.get("_label", "") for c in node.get("_children", [])}
+        _SCAN_LEVEL = {"TableScan", "Select", "CustomOperator"}
+        if child_labels <= _SCAN_LEVEL:
+            label = ""   # force fall-through to transparent pass-through below
+        else:
+            label = "Filter"   # post-join / post-agg filter — emit as Filter node
+
+    # Transparent wrappers and newly-emitted wrapper operators
+    if label in ("Result", "CustomOperator", ""):
         all_entries: list[Entry] = []
         last_ptr: int | None = None
+        child_ptrs_all: list[int] = []   # all child root ptrs (needed by Append)
         all_tables: set[int] = set()
         for child in node.get("_children", []):
             ce, cp, ct = _traverse(child, op_card, ptr_costs, used_ir_ptrs,
@@ -284,6 +347,67 @@ def _traverse(
             all_tables |= ct
             if cp is not None:
                 last_ptr = cp
+                child_ptrs_all.append(cp)
+
+        # ---- Result: handled at the top level in tokenize_physical_plan so
+        #      it always appears as the final entry (after _insert_missing_ptrs).
+        #      Here we simply pass through.
+        if label == "Result":
+            return all_entries, last_ptr, all_tables
+
+        # ---- CustomOperator: dispatch by name ----
+        name = attrs.get("name", "")
+
+        if name == "EmptyResult":
+            # Optimizer replaced a table scan with a zero-row short-circuit.
+            # Match to any unused LogicalTableScan PTR so the IR pointer is consumed.
+            ir_ptr = _find_any_unused_scan(ir_nodes, used_ir_ptrs)
+            if ir_ptr is None:
+                ir_ptr = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+            used_ir_ptrs.add(ir_ptr)
+            ptr_costs[ir_ptr] = 0  # EmptyResult always produces 0 rows
+            tbl_id = ir_nodes[ir_ptr].table_id if ir_ptr in ir_nodes else None
+            inputs = [f"[T{tbl_id}]"] if tbl_id is not None else None
+            return all_entries + [(ir_ptr, "EmptyResult", None, inputs)], ir_ptr, all_tables
+
+        if name == "Limit":
+            candidates = (unary_map.get((last_ptr, "Limit"), []) +
+                          unary_map.get((last_ptr, "_any"), []))
+            ir_ptr = next((c for c in candidates if c not in used_ir_ptrs), None)
+            if ir_ptr is None:
+                ir_ptr, consumed = _find_chain_unary_match(
+                    last_ptr, "Limit", ir_nodes, used_ir_ptrs)
+                for p in consumed:
+                    used_ir_ptrs.add(p)
+                    ptr_costs.setdefault(p, 1)
+            if ir_ptr is None:
+                ir_ptr = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+            used_ir_ptrs.add(ir_ptr)
+            ptr_costs[ir_ptr] = int(op_card.get(attrs.get("operator_id"), 0))
+            inputs = [f"[PTR_{last_ptr}]"] if last_ptr is not None else None
+            return all_entries + [(ir_ptr, "Limit", None, inputs)], ir_ptr, all_tables
+
+        if name == "Materialize":
+            synth = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+            used_ir_ptrs.add(synth)
+            ptr_costs[synth] = int(op_card.get(attrs.get("operator_id"), 0))
+            inputs = [f"[PTR_{last_ptr}]"] if last_ptr is not None else None
+            return all_entries + [(synth, "Materialize", None, inputs)], synth, all_tables
+
+        if name == "Append":
+            synth = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+            used_ir_ptrs.add(synth)
+            ptr_costs[synth] = int(op_card.get(attrs.get("operator_id"), 0))
+            inputs = [f"[PTR_{p}]" for p in child_ptrs_all] if child_ptrs_all else None
+            return all_entries + [(synth, "Append", None, inputs)], synth, all_tables
+
+        # All other CustomOperator subtypes remain transparent pass-throughs:
+        #   Hash (absorbed into HashJoin), Gather/Gather Merge (parallel artifact),
+        #   Projection, DelimScan, CrossProduct, Memoize, BitmapOr, ProjectSet,
+        #   Function Scan, Values Scan, INOUT_FUNCTION.
+        # TODO: Consider emitting the following in a future iteration:
+        #   DelimScan, CrossProduct, Memoize, BitmapOr, ProjectSet,
+        #   Function Scan, Values Scan, INOUT_FUNCTION
         return all_entries, last_ptr, all_tables
 
     # Recurse children (post-order)
@@ -307,7 +431,10 @@ def _traverse(
             child_tables_list.append(ct)
 
     # Unknown label → pass through
-    if label not in ("TableScan", "Join", "GroupBy", "Sort", "Limit", "Filter"):
+    if label not in (
+        "TableScan", "Join", "GroupBy", "Sort", "Limit", "Filter",
+        "Window", "SetOperation", "Map", "Subquery",
+    ):
         return combined, child_ir_ptrs[-1] if child_ir_ptrs else None, all_child_tables
 
     # Cardinality
@@ -401,6 +528,86 @@ def _traverse(
         used_ir_ptrs.add(ir_ptr)
         ptr_costs[ir_ptr] = cardinality
         return combined + fused + [(ir_ptr, phys_op, join_type, [f"[PTR_{p}]" for p in child_ir_ptrs])], ir_ptr, all_child_tables
+
+    # ---- Window (both engines — unary, try IR match then synthetic fallback) ----
+    if label == "Window":
+        child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
+        ir_ptr = None
+        for cand in (unary_map.get((child_ir_ptr, "Window"), []) +
+                     unary_map.get((child_ir_ptr, "_any"), [])):
+            if cand not in used_ir_ptrs:
+                ir_ptr = cand
+                break
+        if ir_ptr is None:
+            ir_ptr, consumed = _find_chain_unary_match(
+                child_ir_ptr, "Window", ir_nodes, used_ir_ptrs)
+            for p in consumed:
+                used_ir_ptrs.add(p)
+                ptr_costs.setdefault(p, 1)
+        if ir_ptr is None:
+            ir_ptr = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+        used_ir_ptrs.add(ir_ptr)
+        ptr_costs[ir_ptr] = cardinality
+        inputs = [f"[PTR_{child_ir_ptr}]"] if child_ir_ptr is not None else None
+        return combined + [(ir_ptr, "Window", None, inputs)], ir_ptr, all_child_tables
+
+    # ---- Map (PG Result node — constant projection / one-time filter) ----
+    if label == "Map":
+        child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
+        ir_ptr = None
+        for cand in (unary_map.get((child_ir_ptr, "Map"), []) +
+                     unary_map.get((child_ir_ptr, "_any"), [])):
+            if cand not in used_ir_ptrs:
+                ir_ptr = cand
+                break
+        if ir_ptr is None:
+            ir_ptr, consumed = _find_chain_unary_match(
+                child_ir_ptr, "Map", ir_nodes, used_ir_ptrs)
+            for p in consumed:
+                used_ir_ptrs.add(p)
+                ptr_costs.setdefault(p, 1)
+        if ir_ptr is None:
+            ir_ptr = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+        used_ir_ptrs.add(ir_ptr)
+        ptr_costs[ir_ptr] = cardinality
+        inputs = [f"[PTR_{child_ir_ptr}]"] if child_ir_ptr is not None else None
+        return combined + [(ir_ptr, "Map", None, inputs)], ir_ptr, all_child_tables
+
+    # ---- SetOperation (UNION / INTERSECT / EXCEPT) ----
+    if label == "SetOperation":
+        # Derive annotation from physical plan metadata
+        raw = (attrs.get("type") or sys_dict.get("Command") or "unionall")
+        _SET_TOK: dict[str, str] = {
+            "unionall": "UNION_ALL", "union": "UNION_ALL",
+            "intersect": "INTERSECT", "except": "EXCEPT",
+        }
+        annotation = f"[{_SET_TOK.get(raw.lower().replace(' ', ''), 'UNION_ALL')}]"
+
+        # Prefer to consume a matching LogicalMinus/LogicalUnion/LogicalIntersect
+        # IR node so _insert_missing_ptrs never sees it as dangling.
+        ir_ptr = None
+        for ptr, node in ir_nodes.items():
+            if ptr not in used_ir_ptrs and node.op in _LOGICAL_SETOP_OPS:
+                ir_ptr = ptr
+                # Refine annotation from the IR node type if available
+                annotation = _LOGICAL_SETOP_ANNOTATION.get(node.op, annotation)
+                break
+        if ir_ptr is None:
+            ir_ptr = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+
+        used_ir_ptrs.add(ir_ptr)
+        ptr_costs[ir_ptr] = cardinality
+        inputs = [f"[PTR_{p}]" for p in child_ir_ptrs] if child_ir_ptrs else None
+        return combined + [(ir_ptr, "SetOp", annotation, inputs)], ir_ptr, all_child_tables
+
+    # ---- Subquery (PG Subquery Scan — unary, synthetic PTR) ----
+    if label == "Subquery":
+        child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
+        synth = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+        used_ir_ptrs.add(synth)
+        ptr_costs[synth] = cardinality
+        inputs = [f"[PTR_{child_ir_ptr}]"] if child_ir_ptr is not None else None
+        return combined + [(synth, "SubqueryScan", None, inputs)], synth, all_child_tables
 
     # ---- Unary: GroupBy, Sort, Limit, Filter ----
     child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
@@ -625,22 +832,48 @@ def _insert_missing_ptrs(
             done.add(ptr)
             remaining.discard(ptr)
 
+    # Build a set of PTRs that were skipped (not emitted) so we can resolve
+    # inputs through them when generating fallback entries.
+    skipped: set[int] = set()
+
     extra: list[Entry] = []
     for ptr in ordered:
         node = ir_nodes[ptr]
         ptr_costs.setdefault(ptr, 1)
         # Filter and Project are always fused into scans/aggregates by PG — skip
         if node.op in ("LogicalFilter", "LogicalProject"):
+            skipped.add(ptr)
             continue
+
+        def _resolve_inputs(ptrs: list[int]) -> list[str]:
+            """Walk through skipped nodes to find the nearest emitted ancestor."""
+            result = []
+            for p in ptrs:
+                visited: set[int] = set()
+                stack = [p]
+                while stack:
+                    cur = stack.pop()
+                    if cur in visited:
+                        continue
+                    visited.add(cur)
+                    if cur not in skipped:
+                        result.append(f"[PTR_{cur}]")
+                        break
+                    # cur was skipped — follow its inputs
+                    parent = ir_nodes.get(cur)
+                    if parent:
+                        stack.extend(parent.inputs)
+            return result
+
         if node.op == "LogicalTableScan":
             t_tok = f"[T{node.table_id}]" if node.table_id is not None else ""
             extra.append((ptr, "SeqScan", None, [t_tok] if t_tok else []))
         elif node.op == "LogicalJoin":
             jt = node.join_type or "[INNER]"
-            extra.append((ptr, "HashJoin", jt, [f"[PTR_{p}]" for p in node.inputs]))
+            extra.append((ptr, "HashJoin", jt, _resolve_inputs(node.inputs)))
         else:
             phys_op = _LOGICAL_TO_PHYS_DEFAULT.get(node.op, "Filter")
-            extra.append((ptr, phys_op, None, [f"[PTR_{p}]" for p in node.inputs]))
+            extra.append((ptr, phys_op, None, _resolve_inputs(node.inputs)))
 
     # Preserve PG post-order for matched entries; missing PTRs appended at end.
     return entries + extra
@@ -932,6 +1165,16 @@ def tokenize_physical_plan(
         used_ir_ptrs: set[int] = set()
         ctx = _TraversalCtx()
 
+        # Strip the top-level Result wrapper so it can be appended last,
+        # after _insert_missing_ptrs has added all missing IR nodes.
+        result_card: int | None = None
+        if tree.get("_label") == "Result":
+            result_attrs = tree.get("_attrs", {})
+            result_card = int(op_card.get(result_attrs.get("operator_id"), 0))
+            children = tree.get("_children", [])
+            if children:
+                tree = children[0]  # traverse the real plan root directly
+
         entries, _, _ = _traverse(
             tree, op_card, ptr_costs, used_ir_ptrs,
             ir_nodes, scan_map, join_map, unary_map,
@@ -943,6 +1186,14 @@ def tokenize_physical_plan(
         missing = set(ir_nodes.keys()) - used_ir_ptrs
         if missing:
             entries = _insert_missing_ptrs(entries, missing, ir_nodes, ptr_costs)
+
+        # Append Result as the final (outermost) entry
+        if result_card is not None and entries:
+            last_ptr = entries[-1][0]
+            synth = _get_synth_ptr(ir_nodes, used_ir_ptrs)
+            used_ir_ptrs.add(synth)
+            ptr_costs[synth] = result_card
+            entries.append((synth, "Result", None, [f"[PTR_{last_ptr}]"]))
 
         if not entries:
             return None

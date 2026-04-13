@@ -691,7 +691,7 @@ def _explain_chunk_duckdb(
                 "message": None,
             }
             try:
-                result = conn.execute(f"EXPLAIN (FORMAT JSON, ANALYZE) {exec_sql}").fetchone()
+                result = conn.execute(f"EXPLAIN (FORMAT JSON) {exec_sql}").fetchone()
 
                 if not result or result[1] is None:
                     source_info["state"] = "error"

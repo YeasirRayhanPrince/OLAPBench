@@ -86,6 +86,9 @@ class TableScan(QueryOperator):
                     log_warn(f"Unknown table scan type: {plan['Node Type']}")
         elif dbms_type == DBMSType.DuckDB:
             table_name = plan["extra_info"]["Table"] if "Table" in plan["extra_info"] else None
+            # DuckDB qualifies names as "schema.catalog.table" — keep only the last part.
+            if table_name and "." in table_name:
+                table_name = table_name.rsplit(".", 1)[-1]
             self.table_name = table_name
         elif dbms_type == DBMSType.ClickHouse:
             storage = plan.get("Storage") or plan.get("storage") or {}
