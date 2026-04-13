@@ -31,11 +31,11 @@ systems:
       path: /scratch1/yrayhan/OLAPBench/data/job.duckdb   # where to create/read the DB
       data_dir: /scratch1/yrayhan/OLAPBench/data/job      # CSV dir (managed mode only)
 benchmarks:
-  - name: job
-  # - name: gendba-pool
-  #   query_dir: full_vn
+  # - name: job
+  - name: gendba-pool
+    query_dir: full_vn
 export:
-  # training_jsonl_name: gendba_local_duckdb_preloaded_full_vn.training.jsonl
-  # manifest_jsonl_name: gendba_local_duckdb_preloaded_full_vn.manifest.jsonl
-  training_jsonl_name: gendba_local_duckdb_preloaded_job.validation.jsonl
-  manifest_jsonl_name: gendba_local_duckdb_preloaded_job.manifest.jsonl
+  training_jsonl_name: gendba_local_duckdb_preloaded_full_vn.training.jsonl
+  manifest_jsonl_name: gendba_local_duckdb_preloaded_full_vn.manifest.jsonl
+  # training_jsonl_name: gendba_local_duckdb_preloaded_job.validation.jsonl
+  # manifest_jsonl_name: gendba_local_duckdb_preloaded_job.manifest.jsonl

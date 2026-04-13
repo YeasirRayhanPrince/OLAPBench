@@ -4,8 +4,10 @@ This document defines every token that can appear in `ir_physical_plan_token`,
 how each maps from `ir_physical_token` operator types, and which tokens are
 shared vs. engine-specific.
 
-Statistics are derived from the full `*_full_vn.training.jsonl` datasets
-(81,532 records per engine, re-tokenized live with the current tokenizer).
+Statistics are derived from the full PG `full_vn.training.jsonl` dataset
+(81,532 records), re-tokenized live with the current tokenizer.
+DuckDB counts are from the JOB validation slice (113 records); full-corpus
+DuckDB counts will differ proportionally.
 
 ---
 
@@ -15,24 +17,23 @@ Statistics are derived from the full `*_full_vn.training.jsonl` datasets
 
 | Token | Description | DuckDB occurrences | PG occurrences |
 |---|---|---|---|
-| `SeqScan` | Sequential table scan | 346,606 | 312,411 |
-| `HashJoin` | Hash join | 323,963 | 201,428 |
-| `Result` | Top-level pipeline result wrapper (always last) | 81,532 | 81,532 |
-| `MergeJoin` | Sort-merge join | 132 | 17,139 |
-| `NestedLoop` | Nested-loop join | 16 | 105,362 |
-| `Sort` | Sort / ORDER BY | 54 | 2,221 |
-| `GroupAggregate` | Streaming / sorted group aggregate | 65 | 7 |
-| `HashAggregate` | Hash-based aggregate | 45 | 320 |
-| `Filter` | Post-join or post-aggregate predicate filter | 1,517 | — |
-| `SetOp` | Set operation: `[UNION_ALL]`, `[INTERSECT]`, `[EXCEPT]` | 24 | 24 |
-| `Window` | Window function | 19 | 19 |
-| `Limit` | `LIMIT` clause | 9 | 385 |
+| `SeqScan` | Sequential table scan | — | 312,411 |
+| `HashJoin` | Hash join | — | 200,931 |
+| `Result` | Top-level pipeline result wrapper (always last) | — | 81,532 |
+| `MergeJoin` | Sort-merge join | — | 17,139 |
+| `NestedLoop` | Nested-loop join | — | 105,362 |
+| `Sort` | Sort / ORDER BY (physical Sort present; two-phase agg Sort is transparent) | — | 14 |
+| `HashAggregate` | Hash-based aggregate | — | 54 |
+| `Filter` | Post-join or post-aggregate predicate filter | — (DuckDB JOB slice: 3) | — |
+| `SetOp` | Set operation: `[UNION_ALL]`, `[INTERSECT]`, `[EXCEPT]` | — | 12 |
+| `Window` | Window function | — | 19 |
+| `Limit` | `LIMIT` clause | — | 385 |
 
 ### DuckDB-only tokens
 
 | Token | Description | DuckDB occurrences |
 |---|---|---|
-| `EmptyResult` | Optimizer short-circuit: query provably returns zero rows | 59,645 |
+| `EmptyResult` | Optimizer short-circuit: query provably returns zero rows | — (full-corpus count TBD) |
 
 ### PostgreSQL-only tokens
 
@@ -166,6 +167,14 @@ Marks the boundary of a FROM-clause inline view or each branch of a
 `UNION`/`INTERSECT`/`EXCEPT` that PG wraps individually before appending.
 Distinct from the `[SUBQUERY]` block in the logical IR, which represents a
 correlated WHERE/EXISTS subquery that PG decorrelates into a `Join`.
+
+**`Sort` — two-phase aggregate transparency**
+PG sometimes executes an aggregate as two GroupBy passes separated by a Sort
+(Sort-based aggregate). Both the Sort and the outer GroupBy are implementation
+artifacts: the logical plan has a single `LogicalAggregate`. The tokenizer
+collapses the pair into one `HashAggregate` token matching `LogicalAggregate`.
+`Sort` tokens only appear for user-visible ORDER BY (when `LogicalSort` is
+present in the IR and the physical Sort is not folded into a Limit).
 
 **Operators deferred for future tokenization**
 The following appear in `ir_physical_token` but are currently transparent

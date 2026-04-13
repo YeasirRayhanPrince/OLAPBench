@@ -368,7 +368,9 @@ def _traverse(
             ptr_costs[ir_ptr] = 0  # EmptyResult always produces 0 rows
             tbl_id = ir_nodes[ir_ptr].table_id if ir_ptr in ir_nodes else None
             inputs = [f"[T{tbl_id}]"] if tbl_id is not None else None
-            return all_entries + [(ir_ptr, "EmptyResult", None, inputs)], ir_ptr, all_tables
+            # Propagate table_id upward so parent joins can use coverage matching.
+            table_set = {tbl_id} if tbl_id is not None else set()
+            return all_entries + [(ir_ptr, "EmptyResult", None, inputs)], ir_ptr, all_tables | table_set
 
         if name == "Limit":
             candidates = (unary_map.get((last_ptr, "Limit"), []) +
@@ -533,8 +535,7 @@ def _traverse(
     if label == "Window":
         child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
         ir_ptr = None
-        for cand in (unary_map.get((child_ir_ptr, "Window"), []) +
-                     unary_map.get((child_ir_ptr, "_any"), [])):
+        for cand in unary_map.get((child_ir_ptr, "Window"), []):
             if cand not in used_ir_ptrs:
                 ir_ptr = cand
                 break
@@ -555,8 +556,7 @@ def _traverse(
     if label == "Map":
         child_ir_ptr = child_ir_ptrs[0] if child_ir_ptrs else None
         ir_ptr = None
-        for cand in (unary_map.get((child_ir_ptr, "Map"), []) +
-                     unary_map.get((child_ir_ptr, "_any"), [])):
+        for cand in unary_map.get((child_ir_ptr, "Map"), []):
             if cand not in used_ir_ptrs:
                 ir_ptr = cand
                 break
@@ -620,11 +620,9 @@ def _traverse(
         if cand not in used_ir_ptrs:
             ir_ptr = cand
             break
-    if ir_ptr is None:
-        for cand in unary_map.get((child_ir_ptr, "_any"), []):
-            if cand not in used_ir_ptrs:
-                ir_ptr = cand
-                break
+    # No _any fallback here: grabbing an incompatible IR node (e.g. LogicalProject
+    # for a GroupBy) produces a phantom extra operator when the real target sits
+    # one hop further up the chain.  Go straight to _find_chain_unary_match.
     if ir_ptr is None:
         ir_ptr, chain_consumed = _find_chain_unary_match(
             child_ir_ptr, label, ir_nodes, used_ir_ptrs)
@@ -814,8 +812,9 @@ def _insert_missing_ptrs(
     missing_ptrs: set[int],
     ir_nodes: dict[int, IRNode],
     ptr_costs: dict[int, int],
+    root_ir_ptr: int | None = None,
 ) -> list[Entry]:
-    """Insert IR PTRs not matched to any PG node, in topological order."""
+    """Insert IR PTRs not matched to any physical node, in topological order."""
     done = {e[0] for e in entries}
     ordered: list[int] = []
     remaining = set(missing_ptrs)
@@ -836,11 +835,27 @@ def _insert_missing_ptrs(
     # inputs through them when generating fallback entries.
     skipped: set[int] = set()
 
+    # Track PTRs already referenced as inputs by traversal-derived entries.
+    # A missing join whose logical inputs overlap this set would create a DAG
+    # (one PTR with two parent operators), so we skip it instead.
+    _PTR_RE = re.compile(r'\[PTR_(\d+)\]')
+    referenced_as_input: set[int] = set()
+    for _, _, _, inp_toks in entries:
+        if inp_toks:
+            for tok in inp_toks:
+                m = _PTR_RE.match(tok)
+                if m:
+                    referenced_as_input.add(int(m.group(1)))
+    # The traversal root will be consumed by Result (appended after this function).
+    # Pre-mark it so missing joins don't create a second parent for it.
+    if root_ir_ptr is not None:
+        referenced_as_input.add(root_ir_ptr)
+
     extra: list[Entry] = []
     for ptr in ordered:
         node = ir_nodes[ptr]
         ptr_costs.setdefault(ptr, 1)
-        # Filter and Project are always fused into scans/aggregates by PG — skip
+        # Filter and Project are always fused into scans/aggregates — skip
         if node.op in ("LogicalFilter", "LogicalProject"):
             skipped.add(ptr)
             continue
@@ -869,13 +884,40 @@ def _insert_missing_ptrs(
             t_tok = f"[T{node.table_id}]" if node.table_id is not None else ""
             extra.append((ptr, "SeqScan", None, [t_tok] if t_tok else []))
         elif node.op == "LogicalJoin":
+            resolved = _resolve_inputs(node.inputs)
+            resolved_ptr_ints = {
+                int(m.group(1))
+                for tok in resolved
+                for m in [_PTR_RE.match(tok)]
+                if m
+            }
+            # If any input PTR is already used by another operator, emitting
+            # this join would give that PTR two parents — a DAG.  Skip it.
+            if resolved_ptr_ints & referenced_as_input:
+                skipped.add(ptr)
+                continue
             jt = node.join_type or "[INNER]"
-            extra.append((ptr, "HashJoin", jt, _resolve_inputs(node.inputs)))
+            extra.append((ptr, "HashJoin", jt, resolved))
+            referenced_as_input.update(resolved_ptr_ints)
         else:
             phys_op = _LOGICAL_TO_PHYS_DEFAULT.get(node.op, "Filter")
-            extra.append((ptr, phys_op, None, _resolve_inputs(node.inputs)))
+            resolved = _resolve_inputs(node.inputs)
+            resolved_ptr_ints = {
+                int(m.group(1))
+                for tok in resolved
+                for m in [_PTR_RE.match(tok)]
+                if m
+            }
+            # Same DAG guard as LogicalJoin: skip if inputs already referenced.
+            # E.g. PG folds ORDER BY ... LIMIT into a single Limit node, leaving
+            # LogicalSort "missing" — it would create a DAG pointing to the Limit.
+            if resolved_ptr_ints & referenced_as_input:
+                skipped.add(ptr)
+                continue
+            extra.append((ptr, phys_op, None, resolved))
+            referenced_as_input.update(resolved_ptr_ints)
 
-    # Preserve PG post-order for matched entries; missing PTRs appended at end.
+    # Preserve physical post-order for matched entries; missing PTRs appended after.
     return entries + extra
 
 
@@ -1175,7 +1217,7 @@ def tokenize_physical_plan(
             if children:
                 tree = children[0]  # traverse the real plan root directly
 
-        entries, _, _ = _traverse(
+        entries, root_ir_ptr, _ = _traverse(
             tree, op_card, ptr_costs, used_ir_ptrs,
             ir_nodes, scan_map, join_map, unary_map,
             table_name_to_id, subquery_filters, ctx,
@@ -1185,15 +1227,17 @@ def tokenize_physical_plan(
         # Insert any missing IR PTRs
         missing = set(ir_nodes.keys()) - used_ir_ptrs
         if missing:
-            entries = _insert_missing_ptrs(entries, missing, ir_nodes, ptr_costs)
+            entries = _insert_missing_ptrs(entries, missing, ir_nodes, ptr_costs, root_ir_ptr)
 
-        # Append Result as the final (outermost) entry
+        # Append Result as the final (outermost) entry.
+        # Use the traversal root (not entries[-1]) so that missing-PTR fallbacks
+        # appended by _insert_missing_ptrs don't hijack the Result pointer.
         if result_card is not None and entries:
-            last_ptr = entries[-1][0]
+            result_input = root_ir_ptr if root_ir_ptr is not None else entries[-1][0]
             synth = _get_synth_ptr(ir_nodes, used_ir_ptrs)
             used_ir_ptrs.add(synth)
             ptr_costs[synth] = result_card
-            entries.append((synth, "Result", None, [f"[PTR_{last_ptr}]"]))
+            entries.append((synth, "Result", None, [f"[PTR_{result_input}]"]))
 
         if not entries:
             return None
