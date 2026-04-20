@@ -36,7 +36,7 @@ benchmarks:
   - name: gendba-pool
     query_dir: full_vn
 export:
-  training_jsonl_name: gendba_local_postgres_preloaded_full_vn.training.jsonl
-  manifest_jsonl_name: gendba_local_postgres_preloaded_full_vn.manifest.jsonl
+  training_jsonl_name: gendba_local_postgres_preloaded_full_vn_dpo.training.jsonl
+  manifest_jsonl_name: gendba_local_postgres_preloaded_full_vn_dpo.manifest.jsonl
   # training_jsonl_name: gendba_local_postgres_preloaded_job.validation.jsonl
   # manifest_jsonl_name: gendba_local_postgres_preloaded_job.manifest.jsonl

@@ -32,6 +32,7 @@ MERGE_FIELDS = [
     "ir_physical_token",
     "ir_physical_plan_token",
     "ir_physical_plan_cardinalities",
+    "plan_variants",
 ]
 
 

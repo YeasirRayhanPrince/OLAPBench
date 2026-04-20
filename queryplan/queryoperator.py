@@ -82,6 +82,9 @@ class TableScan(QueryOperator):
                 case "Index Scan" | "Index Only Scan":
                     self.table_name = plan["Relation Name"]
                     self.type = "index"
+                case "Bitmap Heap Scan":
+                    self.table_name = plan["Relation Name"]
+                    self.type = "bitmap"
                 case _:
                     log_warn(f"Unknown table scan type: {plan['Node Type']}")
         elif dbms_type == DBMSType.DuckDB:

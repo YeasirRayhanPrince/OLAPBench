@@ -93,7 +93,6 @@ _PG_LABEL_TO_IR_OPS: dict[str, set[str]] = {
 
 _SCAN_TYPE_MAP: list[tuple[str, str]] = [
     ("Index Only Scan", "IndexOnlyScan"),
-    ("Bitmap Index Scan", "BitmapIndexScan"),
     ("Bitmap Heap Scan", "BitmapHeapScan"),
     ("Index Scan", "IndexScan"),
     ("Seq Scan", "SeqScan"),

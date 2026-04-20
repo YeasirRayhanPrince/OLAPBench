@@ -41,6 +41,7 @@ DuckDB counts will differ proportionally.
 |---|---|---|
 | `IndexScan` | B-tree / GiST index scan with heap fetch | 51,834 |
 | `IndexOnlyScan` | Index-only scan (no heap fetch) | 42,006 |
+| `BitmapHeapScan` | Bitmap heap scan — heap fetch driven by a bitmap built by child `Bitmap Index Scan` | — |
 | `Materialize` | Explicit result materialization (CTE / subquery boundary) | 8,927 |
 | `Map` | PG `Result` node — constant projection or one-time filter | 357 |
 | `SubqueryScan` | FROM-clause inline view / each branch of UNION-INTERSECT-EXCEPT | 24 |
@@ -64,6 +65,7 @@ Every token entry in `[PHYSICAL_PLAN]` follows this format:
 | `SeqScan` | `[FILTER P_n ...]` | `[PTR_0] SeqScan [FILTER P_0 P_1]` |
 | `IndexScan` | `[INDEX_COND P_n ...]` | `[PTR_0] IndexScan [INDEX_COND P_0]` |
 | `IndexOnlyScan` | `[INDEX_COND P_n ...]` | `[PTR_0] IndexOnlyScan [INDEX_COND P_0]` |
+| `BitmapHeapScan` | `[FILTER P_n ...]` | `[PTR_0] BitmapHeapScan [FILTER P_0]` |
 | `HashJoin` | `[INNER\|LEFT\|RIGHT\|FULL\|SEMI\|ANTI]`, `[HASH_COND P_n ...]` | `[PTR_2] HashJoin [INNER] [HASH_COND P_0]` |
 | `MergeJoin` | join type, `[MERGE_COND P_n ...]` | `[PTR_2] MergeJoin [LEFT] [MERGE_COND P_0]` |
 | `NestedLoop` | join type, `[JOIN_FILTER P_n ...]` | `[PTR_2] NestedLoop [INNER]` |
@@ -115,6 +117,8 @@ Every token entry in `[PHYSICAL_PLAN]` follows this format:
 | `TableScan` (seq) | `Seq Scan` | `SeqScan` |
 | `TableScan` (index) | `Index Scan` | `IndexScan` |
 | `TableScan` (index-only) | `Index Only Scan` | `IndexOnlyScan` |
+| `TableScan` (bitmap) | `Bitmap Heap Scan` | `BitmapHeapScan` |
+| `CustomOperator` / `Bitmap Index Scan` | `Bitmap Index Scan` *(index phase of bitmap scan, no heap access)* | *(transparent — child of `BitmapHeapScan`)* |
 | `Join` | `Hash Join` | `HashJoin` |
 | `Join` | `Merge Join` | `MergeJoin` |
 | `Join` | `Nested Loop` | `NestedLoop` |
@@ -175,6 +179,9 @@ artifacts: the logical plan has a single `LogicalAggregate`. The tokenizer
 collapses the pair into one `HashAggregate` token matching `LogicalAggregate`.
 `Sort` tokens only appear for user-visible ORDER BY (when `LogicalSort` is
 present in the IR and the physical Sort is not folded into a Limit).
+
+**`BitmapHeapScan` (PG only)**
+PG's two-phase bitmap scan: a `Bitmap Index Scan` child scans the index and builds an in-memory bitmap of matching TIDs; the `Bitmap Heap Scan` parent then fetches the corresponding heap pages. Only `Bitmap Heap Scan` is a `TableScan` in the parsed plan (it carries `Relation Name`). `Bitmap Index Scan` is parsed as a `CustomOperator` and is transparent to the tokenizer — it is silently consumed as a child, and `BitmapHeapScan` is the emitted token. Predicates are not currently annotated on `BitmapHeapScan` (the index condition is on the transparent child).
 
 **Operators deferred for future tokenization**
 The following appear in `ir_physical_token` but are currently transparent

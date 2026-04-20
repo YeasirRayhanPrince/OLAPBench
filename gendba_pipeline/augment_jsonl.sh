@@ -18,10 +18,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VENV_ACTIVATE="${REPO_ROOT}/.venv/bin/activate"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-
-BASE="${SCRIPT_DIR}/output/gendba_local_postgres_preloaded/gendba_local_postgres_preloaded_full_vn.training.jsonl"
+BASE="${SCRIPT_DIR}/output/gendba_local_postgres_preloaded/gendba_local_postgres_preloaded_full_vn_dpo.training.jsonl"
 PATCH="${SCRIPT_DIR}/output/gendba_local_duckdb/gendba_local_duckdb_preloaded_full_vn.training.jsonl"
-OUT="${SCRIPT_DIR}/output/merged/merged_full_vn.training.jsonl"
+OUT="${SCRIPT_DIR}/output/dpo/dpo_full_vn.training.jsonl"
 
 # BASE="${SCRIPT_DIR}/output/gendba_local_postgres_preloaded/gendba_local_postgres_preloaded_job.validation.jsonl"
 # PATCH="${SCRIPT_DIR}/output/gendba_local_duckdb/gendba_local_duckdb_preloaded_job.validation.jsonl"

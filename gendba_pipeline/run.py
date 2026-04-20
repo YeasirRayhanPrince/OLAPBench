@@ -6,6 +6,7 @@ import csv
 import datetime as dt
 import multiprocessing
 import os
+import random
 import re
 import subprocess
 import sys
@@ -452,6 +453,51 @@ def _run_physical_group(
     return _collect_physical_tokens(result_csv_path)
 
 
+def _build_leading_hint(join_tree) -> str:
+    """Build a pg_hint_plan Leading(...) comment from a PostBOUND JoinTree."""
+    def _walk(node) -> str:
+        if node.is_scan():
+            return node.base_table.identifier()
+        lhs = _walk(node.outer_child)
+        rhs = _walk(node.inner_child)
+        return f"({lhs} {rhs})"
+    return f"/*+ Leading({_walk(join_tree)}) */"
+
+
+def _build_operator_hint(join_tree) -> str:
+    """Build a pg_hint_plan hint with Leading + randomly chosen join and scan operators."""
+    _JOIN_OPS = ["NestLoop", "HashJoin", "MergeJoin"]
+    _SCAN_OPS = ["SeqScan", "IndexOnlyScan", "BitmapScan"]
+
+    def _walk(node) -> str:
+        if node.is_scan():
+            return node.base_table.identifier()
+        lhs = _walk(node.outer_child)
+        rhs = _walk(node.inner_child)
+        return f"({lhs} {rhs})"
+
+    parts = [f"Leading({_walk(join_tree)})"]
+    for join_node in join_tree.iterjoins():
+        tables_str = " ".join(sorted(t.identifier() for t in join_node.tables()))
+        parts.append(f"{random.choice(_JOIN_OPS)}({tables_str})")
+    for table in join_tree.tables():
+        parts.append(f"{random.choice(_SCAN_OPS)}({table.identifier()})")
+    return "/*+ " + " ".join(parts) + " */"
+
+
+def _extract_base_table_cards(plan_node: dict) -> dict[str, int]:
+    """Traverse an EXPLAIN JSON plan node tree, returning {alias: plan_rows} for base scans."""
+    _SCAN_TYPES = {"Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Scan"}
+    result: dict[str, int] = {}
+    if plan_node.get("Node Type") in _SCAN_TYPES:
+        alias = plan_node.get("Alias") or plan_node.get("Relation Name")
+        if alias:
+            result[alias] = max(1, int(plan_node.get("Plan Rows", 1)))
+    for child in plan_node.get("Plans", []):
+        result.update(_extract_base_table_cards(child))
+    return result
+
+
 def _explain_chunk(
     chunk: list,
     conn_params: dict,
@@ -554,6 +600,291 @@ def _explain_chunk(
             if (i + 1) % 500 == 0 or (i + 1) == len(chunk):
                 print(
                     f"[explain-chunk {chunk_index+1}/{total_chunks}] "
+                    f"{i+1}/{len(chunk)} done"
+                )
+    finally:
+        conn.close()
+
+    return tokens, sources
+
+
+def _explain_chunk_dpo(
+    chunk: list,
+    conn_params: dict,
+    system_meta: dict,
+    chunk_index: int,
+    total_chunks: int,
+    total_queries: int,
+    dpo_variants: int = 10,
+    dpo_variants_op: int = 0,
+    dpo_variants_card: int = 0,
+) -> tuple[dict, dict]:
+    """Worker: run EXPLAIN + PostBOUND DPO plan variants for one chunk of queries.
+
+    Generates up to three types of plan variants per query:
+      - join_order: random bushy join orders via RandomJoinOrderGenerator + Leading() hint
+      - operator:   random join/scan operator assignments via _build_operator_hint
+      - cardinality: distorted base-table row estimates via Rows() hints
+
+    Must be module-level for ProcessPoolExecutor pickling. All imports are lazy.
+    PostBOUND parse/graph failures and per-variant EXPLAIN errors are silently skipped.
+    """
+    try:
+        import psycopg2
+    except ImportError:
+        raise RuntimeError("psycopg2 is required for --explain-only mode")
+
+    import sys as _sys
+    import pathlib as _pathlib
+    _postbound_root = str(_pathlib.Path(__file__).resolve().parents[1] / "PostBOUND")
+    if _postbound_root not in _sys.path:
+        _sys.path.insert(0, _postbound_root)
+
+    from postbound.parser import parse_query as _pb_parse_query
+    from postbound.opt.randomized import RandomJoinOrderGenerator as _RJOGen
+    from queryplan.parsers.postgresparser import PostgresParser
+    from queryplan.queryplan import encode_query_plan
+
+    host = conn_params["host"]
+    port = conn_params["port"]
+    user = conn_params["user"]
+    password = conn_params.get("password") or ""
+    database = conn_params["database"]
+
+    tokens: dict = {}
+    sources: dict = {}
+
+    conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=database)
+    conn.autocommit = True
+    print(
+        f"[explain-chunk-dpo {chunk_index+1}/{total_chunks}] Connected to PostgreSQL at "
+        f"{host}:{port} db={database} user={user} "
+        f"({len(chunk)} queries of {total_queries} total, "
+        f"join={dpo_variants} op={dpo_variants_op} card={dpo_variants_card} variants each)"
+    )
+
+    # Check pg_hint_plan availability once for the whole chunk.
+    pg_hint_plan_ok = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW pg_hint_plan.enable_hint;")
+            val = (cur.fetchone() or ["off"])[0]
+        pg_hint_plan_ok = val.lower() == "on"
+        if not pg_hint_plan_ok:
+            print(
+                f"[explain-chunk-dpo {chunk_index+1}/{total_chunks}] "
+                "pg_hint_plan.enable_hint is off — DPO variants will be skipped."
+            )
+    except Exception:
+        print(
+            f"[explain-chunk-dpo {chunk_index+1}/{total_chunks}] "
+            "pg_hint_plan not available — DPO variants will be skipped."
+        )
+
+    try:
+        for i, entry in enumerate(chunk):
+            query_id = entry.query_id
+            sql = entry.sql.strip()
+            source_info: dict = {
+                "state": "unknown",
+                "result_csv_path": None,
+                "query_id": query_id,
+                "dbms": system_meta["dbms"],
+                "version": system_meta.get("version"),
+                "title": system_meta.get("title"),
+                "message": None,
+            }
+            try:
+                # ── default plan (identical to _explain_chunk) ───────────────
+                with conn.cursor() as cur:
+                    cur.execute(f"EXPLAIN (format json) {sql}")
+                    row = cur.fetchone()
+
+                if not row or not row[0]:
+                    source_info["state"] = "error"
+                    source_info["message"] = "No plan returned by EXPLAIN"
+                    sources[query_id] = source_info
+                    continue
+
+                pg_json = row[0]
+                if isinstance(pg_json, list):
+                    pg_json = pg_json[0]
+
+                augmented = _inject_explain_only_stats(pg_json.get("Plan", pg_json))
+                plan_dict = {"Plan": augmented}
+
+                parser = PostgresParser(include_system_representation=True)
+                query_plan = parser.parse_json_plan(sql, plan_dict)
+                plan_str = encode_query_plan(query_plan)
+                plan_doc = _loads(plan_str)
+
+                if not isinstance(plan_doc, dict):
+                    source_info["state"] = "error"
+                    source_info["message"] = "Plan encoding produced unexpected type"
+                    sources[query_id] = source_info
+                    continue
+
+                plan_root = plan_doc.get("queryPlan")
+                if not isinstance(plan_root, dict):
+                    source_info["state"] = "error"
+                    source_info["message"] = "No queryPlan key in encoded plan"
+                    sources[query_id] = source_info
+                    continue
+
+                operators: list = []
+                _flatten_plan(plan_root, operators)
+                token_entry: dict = {"plan": plan_doc, "operators": operators}
+
+                # ── DPO variants via PostBOUND + pg_hint_plan ────────────────
+                if pg_hint_plan_ok and (dpo_variants > 0 or dpo_variants_op > 0 or dpo_variants_card > 0):
+                    plan_variants: list[dict] = []
+                    variant_id = 1
+
+                    def _run_hinted_explain(hint: str) -> tuple[dict, list, float] | None:
+                        """Execute EXPLAIN with hint, parse, return (plan_doc, operators, cost) or None."""
+                        hinted_sql = f"EXPLAIN (format json) {hint}\n{sql}"
+                        with conn.cursor() as _cur:
+                            _cur.execute(hinted_sql)
+                            _vrow = _cur.fetchone()
+                        if not _vrow or not _vrow[0]:
+                            return None
+                        _vpg = _vrow[0]
+                        if isinstance(_vpg, list):
+                            _vpg = _vpg[0]
+                        _plan_node = _vpg.get("Plan", _vpg)
+                        _cost = float(_plan_node.get("Total Cost", float("nan")))
+                        _vaug = _inject_explain_only_stats(_plan_node)
+                        _vplan_doc = _loads(encode_query_plan(
+                            PostgresParser(include_system_representation=True).parse_json_plan(sql, {"Plan": _vaug})
+                        ))
+                        if not isinstance(_vplan_doc, dict) or not isinstance(_vplan_doc.get("queryPlan"), dict):
+                            return None
+                        _vops: list = []
+                        _flatten_plan(_vplan_doc["queryPlan"], _vops)
+                        return _vplan_doc, _vops, _cost
+
+                    # ── Join order variants ──────────────────────────────────
+                    if dpo_variants > 0:
+                        try:
+                            pb_query = _pb_parse_query(sql, bind_columns=False)
+                            jog = _RJOGen(eliminate_duplicates=False)
+                            join_order_gen = jog.random_join_orders_for(pb_query)
+                            seen_hints: set[str] = set()
+                            jo_collected = 0
+                            attempts = 0
+
+                            while jo_collected < dpo_variants and attempts < dpo_variants * 5:
+                                attempts += 1
+                                try:
+                                    join_tree = next(join_order_gen)
+                                    hint_str = _build_leading_hint(join_tree)
+                                    if hint_str in seen_hints:
+                                        continue
+                                    seen_hints.add(hint_str)
+                                    parsed = _run_hinted_explain(hint_str)
+                                    if parsed is None:
+                                        continue
+                                    vplan_doc, voperators, total_cost = parsed
+                                    plan_variants.append({
+                                        "variant_id": variant_id,
+                                        "variant_type": "join_order",
+                                        "hint": hint_str,
+                                        "raw_phys": {"plan": vplan_doc, "operators": voperators},
+                                        "total_cost": total_cost,
+                                    })
+                                    variant_id += 1
+                                    jo_collected += 1
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+
+                    # ── Operator selection variants ──────────────────────────
+                    if dpo_variants_op > 0:
+                        try:
+                            pb_query_op = _pb_parse_query(sql, bind_columns=False)
+                            jog_op = _RJOGen(eliminate_duplicates=False)
+                            join_order_gen_op = jog_op.random_join_orders_for(pb_query_op)
+                            seen_op_hints: set[str] = set()
+                            op_collected = 0
+                            op_attempts = 0
+
+                            while op_collected < dpo_variants_op and op_attempts < dpo_variants_op * 5:
+                                op_attempts += 1
+                                try:
+                                    join_tree_op = next(join_order_gen_op)
+                                    hint_str = _build_operator_hint(join_tree_op)
+                                    if hint_str in seen_op_hints:
+                                        continue
+                                    seen_op_hints.add(hint_str)
+                                    parsed = _run_hinted_explain(hint_str)
+                                    if parsed is None:
+                                        continue
+                                    vplan_doc, voperators, total_cost = parsed
+                                    plan_variants.append({
+                                        "variant_id": variant_id,
+                                        "variant_type": "operator",
+                                        "hint": hint_str,
+                                        "raw_phys": {"plan": vplan_doc, "operators": voperators},
+                                        "total_cost": total_cost,
+                                    })
+                                    variant_id += 1
+                                    op_collected += 1
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+
+                    # ── Cardinality injection variants ───────────────────────
+                    if dpo_variants_card > 0:
+                        base_cards = _extract_base_table_cards(pg_json.get("Plan", pg_json))
+                        if base_cards:
+                            seen_card_hints: set[str] = set()
+                            card_collected = 0
+                            card_attempts = 0
+
+                            while card_collected < dpo_variants_card and card_attempts < dpo_variants_card * 5:
+                                card_attempts += 1
+                                try:
+                                    rows_parts = [
+                                        f"Rows({alias} #{max(1, int(base_rows * 10 ** random.uniform(-2, 2)))})"
+                                        for alias, base_rows in base_cards.items()
+                                    ]
+                                    hint_str = "/*+ " + " ".join(rows_parts) + " */"
+                                    if hint_str in seen_card_hints:
+                                        continue
+                                    seen_card_hints.add(hint_str)
+                                    parsed = _run_hinted_explain(hint_str)
+                                    if parsed is None:
+                                        continue
+                                    vplan_doc, voperators, total_cost = parsed
+                                    plan_variants.append({
+                                        "variant_id": variant_id,
+                                        "variant_type": "cardinality",
+                                        "hint": hint_str,
+                                        "raw_phys": {"plan": vplan_doc, "operators": voperators},
+                                        "total_cost": total_cost,
+                                    })
+                                    variant_id += 1
+                                    card_collected += 1
+                                except Exception:
+                                    continue
+
+                    if plan_variants:
+                        token_entry["plan_variants"] = plan_variants
+
+                tokens[query_id] = token_entry
+                source_info["state"] = "success"
+                sources[query_id] = source_info
+
+            except Exception as exc:
+                source_info["state"] = "error"
+                source_info["message"] = str(exc)
+                sources[query_id] = source_info
+
+            if (i + 1) % 500 == 0 or (i + 1) == len(chunk):
+                print(
+                    f"[explain-chunk-dpo {chunk_index+1}/{total_chunks}] "
                     f"{i+1}/{len(chunk)} done"
                 )
     finally:
@@ -745,6 +1076,9 @@ def _run_explain_group(
     group: QueryGroup,
     system: dict[str, Any],
     workers: int = 1,
+    dpo_variants: int = 0,
+    dpo_variants_op: int = 0,
+    dpo_variants_card: int = 0,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Run EXPLAIN for each query and return plan tokens without executing.
 
@@ -756,6 +1090,9 @@ def _run_explain_group(
     When workers > 1, splits group.queries into equal chunks and dispatches each chunk
     to a separate subprocess via ProcessPoolExecutor, bypassing the GIL for CPU-bound
     plan parsing. Each worker opens its own DB connection.
+
+    When dpo_variants > 0, uses _explain_chunk_dpo instead of _explain_chunk to
+    generate additional hint-forced plan variants per query for DPO training.
     """
     params = system["parameter"]
     dbms = system["dbms"]
@@ -772,7 +1109,7 @@ def _run_explain_group(
             "password": params.get("local_password") or "",
             "database": params.get("local_database", "postgres"),
         }
-        chunk_fn = _explain_chunk
+        chunk_fn = _explain_chunk_dpo if (dpo_variants > 0 or dpo_variants_op > 0 or dpo_variants_card > 0) else _explain_chunk
     elif dbms == "duckdb":
         try:
             import duckdb  # noqa: F401 — validate availability before dispatch
@@ -784,6 +1121,11 @@ def _run_explain_group(
         chunk_fn = _explain_chunk_duckdb
     else:
         raise ValueError(f"--explain-only mode is not supported for dbms '{dbms}'")
+
+    extra_kwargs = (
+        {"dpo_variants": dpo_variants, "dpo_variants_op": dpo_variants_op, "dpo_variants_card": dpo_variants_card}
+        if (dpo_variants > 0 or dpo_variants_op > 0 or dpo_variants_card > 0) else {}
+    )
 
     system_meta = {
         "dbms": system["dbms"],
@@ -828,6 +1170,7 @@ def _run_explain_group(
                 chunk_index=0,
                 total_chunks=1,
                 total_queries=n,
+                **extra_kwargs,
             )
             with completed_lock:
                 completed[0] = n
@@ -855,6 +1198,7 @@ def _run_explain_group(
                     chunk_index=idx,
                     total_chunks=actual_workers,
                     total_queries=n,
+                    **extra_kwargs,
                 ): (idx, chunk)
                 for idx, chunk in enumerate(chunks)
             }
@@ -936,16 +1280,54 @@ def _iter_training_and_manifest_rows(
                     phys_token_strs[engine_key] = tok
                     phys_cardinalities[engine_key] = cards
 
+        # Tokenize DPO plan variants (present only when --dpo-variants > 0)
+        plan_variants_by_engine: dict[str, list[dict]] = {}
+        if table_name_to_id_by_group:
+            tbl_map = table_name_to_id_by_group.get(entry.group_key, {})
+            pred_reg = logical_record.get("pred_registry")
+            for engine_key, raw_phys in physical_token_map.items():
+                raw_variants = raw_phys.get("plan_variants")
+                if not raw_variants:
+                    continue
+                tokenized: list[dict] = []
+                for v in raw_variants:
+                    try:
+                        result = tokenize_physical_plan(
+                            logical_ir, v["raw_phys"], tbl_map, pred_registry=pred_reg
+                        )
+                        if result is None:
+                            continue
+                        tok, cards = result
+                        tokenized.append({
+                            "variant_id": v["variant_id"],
+                            "hint": v["hint"],
+                            "ir_physical_plan_token": tok,
+                            "ir_physical_plan_cardinalities": cards,
+                            "total_cost": v["total_cost"],
+                        })
+                    except Exception:
+                        continue
+                if tokenized:
+                    plan_variants_by_engine[engine_key] = tokenized
+
+        # Strip internal plan_variants key from ir_physical_token to avoid bloat
+        clean_token_map = {
+            ek: {k: v for k, v in tok.items() if k != "plan_variants"}
+            for ek, tok in physical_token_map.items()
+        }
+
         training_row = {
             "id": next_id,
             "schema": entry.schema,
             "sql_file_name": entry.query_id,
             "sql": entry.sql,
             "ir_logical_token": logical_ir,
-            "ir_physical_token": physical_token_map,
+            "ir_physical_token": clean_token_map,
             "ir_physical_plan_token": phys_token_strs,
             "ir_physical_plan_cardinalities": phys_cardinalities,
         }
+        if plan_variants_by_engine:
+            training_row["plan_variants"] = plan_variants_by_engine
 
         manifest_row = {
             "id": next_id,
@@ -999,6 +1381,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
         args.calcite_workers if args.calcite_workers is not None
         else min(16, os.cpu_count() or 1)
     )
+    dpo_variants: int = getattr(args, "dpo_variants", 0) or 0
+    dpo_variants_op: int = getattr(args, "dpo_variants_op", 0) or 0
+    dpo_variants_card: int = getattr(args, "dpo_variants_card", 0) or 0
 
     print(f"[pipeline] Loading {len(spec.get('benchmarks', []))} benchmark(s) …")
     groups, query_entries = _resolve_query_groups(spec)
@@ -1076,6 +1461,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
                         group=group,
                         system=system,
                         workers=explain_workers,
+                        dpo_variants=dpo_variants,
+                        dpo_variants_op=dpo_variants_op,
+                        dpo_variants_card=dpo_variants_card,
                     )
                 else:
                     tokens, sources = _run_physical_group(
@@ -1213,6 +1601,38 @@ def main():
             "Number of parallel JVM processes for Calcite plan generation "
             "and post-processing workers. Default: min(16, os.cpu_count()). "
             "Set to 1 to disable parallelism."
+        ),
+    )
+    parser.add_argument(
+        "--dpo-variants",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of random join-order variants per query (DPO mode). "
+            "Default: 0 (disabled). Requires --explain-only and pg_hint_plan."
+        ),
+    )
+    parser.add_argument(
+        "--dpo-variants-op",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of random physical-operator variants per query (DPO mode). "
+            "Each variant combines a random join order with random join/scan operator hints. "
+            "Default: 0 (disabled). Requires --explain-only and pg_hint_plan."
+        ),
+    )
+    parser.add_argument(
+        "--dpo-variants-card",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of cardinality-injection variants per query (DPO mode). "
+            "Each variant injects distorted Rows() hints to force re-planning under estimation errors. "
+            "Default: 0 (disabled). Requires --explain-only and pg_hint_plan."
         ),
     )
     args = parser.parse_args()
